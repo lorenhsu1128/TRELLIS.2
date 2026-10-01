@@ -18,8 +18,28 @@
 ## 環境需求與安裝
 
 - **官方僅在 Linux 上測試**，需要 ≥24GB 顯存的 NVIDIA GPU（A100/H100 驗證過）；`setup.sh` 也支援 AMD ROCm（`hip`）。
-- 目前工作目錄位於 **Windows**：`setup.sh` 使用 `getopt`、`conda activate`、`sudo apt`，且須以 `source`（`. ./setup.sh`）執行，在 Windows 上無法直接使用。CUDA 擴充套件（o-voxel、FlexGEMM、CuMesh、nvdiffrast、flash-attn）在 Windows 編譯需另行處理，建議改用 WSL2/Linux。
 - `o-voxel/third_party/eigen` 是 git submodule，目前**尚未初始化**；編譯 o-voxel 前須執行 `git submodule update --init --recursive`。
+
+### 本機開發環境（Windows 11 + conda `ai_server`）
+
+**所有開發、執行、安裝一律在 conda 環境 `ai_server` 中進行**，不要另建 `trellis2` 環境，也不要使用 `setup.sh --new-env`。
+
+- 啟用：`conda activate ai_server`；在 Claude Code 的 Bash/PowerShell 工具中，直接呼叫 `C:\Users\ADMIN\miniconda3\envs\ai_server\python.exe`（`python -m pip ...` 亦同），避免 `conda run` 的編碼問題。
+- 環境現況：Python 3.12、PyTorch 2.8.0 + CUDA 12.9（`torch.cuda.get_arch_list()` 含 `sm_120`）、transformers 4.56.1、gradio 5.44.1。
+- 硬體與工具鏈：NVIDIA GeForce RTX 5090（Blackwell，compute capability 12.0，32GB）、CUDA Toolkit 12.9（`C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9`）、Visual Studio 2022 MSVC 14.44。
+- `ai_server` 是**多個專案共用**的環境：升級或降級共用套件（torch、transformers、gradio 等）前要先詢問使用者。
+
+Windows 不在官方支援範圍內，`setup.sh`（`getopt`、`sudo apt`、`/tmp`、需以 `source` 執行）無法使用，須手動安裝。與官方 Linux 流程的差異：
+
+- **PyTorch 版本**：官方用 torch 2.6.0 + cu124，但 cu124 不支援 RTX 5090（sm_120），必須沿用 `ai_server` 的 torch 2.8.0 + cu129，**不要**照 `setup.sh` 降版。
+- **注意力後端**：flash-attn 沒有官方 Windows wheel，在 Windows 上替 sm_120 編譯很困難 → 改裝 xformers（需與 torch 2.8.0/cu129 相容的版本），並設定 `ATTN_BACKEND=xformers`（稀疏注意力只支援 `xformers`/`flash_attn`/`flash_attn_3`，不能用 `sdpa`）。
+- **稀疏卷積後端**：預設 `flex_gemm`（FlexGEMM）以 Triton 實作，Windows 需改裝 `triton-windows`（版本對應 torch 2.8）；是否能在 Windows 正常運作尚未驗證，不行時可改試 `SPARSE_CONV_BACKEND=spconv`。
+- **CUDA 擴充（o-voxel、CuMesh、FlexGEMM、nvdiffrast v0.4.0、nvdiffrec renderutils 分支）**：在「x64 Native Tools Command Prompt for VS 2022」中、啟用 `ai_server` 後，設定 `CUDA_HOME` 指向 v12.9、`TORCH_CUDA_ARCH_LIST=12.0`，再以 `pip install <路徑> --no-build-isolation` 編譯。o-voxel 的 `-O3` 等 GCC 旗標在 MSVC 下僅會出現警告。
+- **其他套件**：`pillow-simd` 與 `sudo apt install libjpeg-dev` 跳過，使用一般 `pillow`；其餘依 `setup.sh` 的 `--basic` 清單安裝（`utils3d` 須釘選相同 commit）。
+- **gradio**：`app.py` 使用 gradio 6 的 `demo.launch(css=..., head=...)` 寫法（`setup.sh` 釘選 6.0.1），而 `ai_server` 為 5.44.1；升級前需徵得同意，否則需調整 `app.py`。
+- **Hugging Face**：首次執行會下載 `microsoft/TRELLIS.2-4B`、DINOv3（`facebook/dinov3-*`，為需同意授權的 gated 模型，需先 `huggingface-cli login`）與 BiRefNet（`trust_remote_code=True`）。
+
+### 官方 Linux 安裝方式（參考）
 
 ```sh
 # 建立 conda 環境 trellis2（Python 3.10、PyTorch 2.6.0 + CUDA 12.4）並安裝所有相依套件
