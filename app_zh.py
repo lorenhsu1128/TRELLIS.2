@@ -2,7 +2,9 @@ import gradio as gr
 
 import os
 os.environ['OPENCV_IO_ENABLE_OPENEXR'] = '1'
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+# The launcher may override this: under WSL, expandable segments can fail with
+# "CUDA driver error: device not ready" once a smaller (e.g. 12GB) GPU runs near full.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 from datetime import datetime
 import shutil
 import cv2
@@ -23,10 +25,19 @@ from collections import OrderedDict
 import trimesh
 from trellis2.modules.sparse import SparseTensor
 from trellis2.modules import image_feature_extractor
-from trellis2.pipelines import Trellis2ImageTo3DPipeline
+from trellis2.pipelines import Trellis2ImageTo3DPipeline, rembg
 from trellis2.renderers import EnvMap
 from trellis2.utils import render_utils
 import o_voxel
+
+# xformers prefers its FlashAttention-3 kernels, which only run on Hopper (sm_90); on other GPUs
+# (e.g. Blackwell sm_120) they fail with "invalid argument", so fall back to FA2 / cutlass there.
+if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] != 9:
+    try:
+        from xformers.ops.fmha import dispatch as _xformers_dispatch
+        _xformers_dispatch._set_use_fa3(False)
+    except ImportError:
+        pass
 
 
 # Traditional Chinese, LAN-accessible version of app.py (mirrors the official HF Space).
@@ -43,6 +54,18 @@ def _dinov3_init_with_mirror(self, model_name, *args, **kwargs):
         model_name = DINOV3_MODEL
     _dinov3_init(self, model_name, *args, **kwargs)
 image_feature_extractor.DinoV3FeatureExtractor.__init__ = _dinov3_init_with_mirror
+
+# Same for the background remover: briaai/RMBG-2.0 is gated; the public mirror has an
+# identical model.safetensors (sha256 566ed80c...c3a7). Override with RMBG_MODEL.
+RMBG_OFFICIAL = "briaai/RMBG-2.0"
+RMBG_MODEL = os.environ.get("RMBG_MODEL", "camenduru/RMBG-2.0")
+
+_rmbg_init = rembg.BiRefNet.__init__
+def _rmbg_init_with_mirror(self, model_name=RMBG_OFFICIAL, *args, **kwargs):
+    if model_name == RMBG_OFFICIAL:
+        model_name = RMBG_MODEL
+    _rmbg_init(self, model_name, *args, **kwargs)
+rembg.BiRefNet.__init__ = _rmbg_init_with_mirror
 
 MAX_SEED = np.iinfo(np.int32).max
 # Keep per-session outputs outside the repo (.gitignore does not exclude tmp/).

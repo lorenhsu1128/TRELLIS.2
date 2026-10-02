@@ -6,6 +6,16 @@ conda activate trellis2
 cd "$(dirname "$(readlink -f "$0")")"
 export APP_PORT="${APP_PORT:-7860}"
 export PYTHONUNBUFFERED=1 GRADIO_ANALYTICS_ENABLED=False
+# Fall back to xformers attention when flash-attn is not installed (e.g. Blackwell GPUs without a flash-attn build)
+if [ -z "$ATTN_BACKEND" ] && ! python -c "import flash_attn" 2>/dev/null; then
+  export ATTN_BACKEND=xformers
+fi
+# Under WSL, expandable segments cannot spill past dedicated VRAM and fail with "CUDA driver error:
+# device not ready" on GPUs below ~24GB; the native allocator spills to shared memory (slower) instead.
+if [ -z "$PYTORCH_CUDA_ALLOC_CONF" ]; then
+  VRAM_MB=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1)
+  if [ "${VRAM_MB:-0}" -lt 24000 ]; then export PYTORCH_CUDA_ALLOC_CONF=backend:native; fi
+fi
 # Fixed mmap threshold: large tensor buffers are mmapped and returned to the OS when freed
 # (glibc otherwise raises the threshold dynamically and the heap fragments until OOM)
 export MALLOC_MMAP_THRESHOLD_=1048576 MALLOC_TRIM_THRESHOLD_=67108864
