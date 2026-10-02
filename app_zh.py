@@ -14,6 +14,7 @@ import base64
 import io
 import uuid
 import json
+import subprocess
 import re
 import gc
 import ctypes
@@ -47,6 +48,14 @@ MAX_SEED = np.iinfo(np.int32).max
 TMP_DIR = os.environ.get("APP_TMP_DIR", os.path.expanduser("~/.cache/trellis2_app_zh/tmp"))
 # Vendored three.js (r170) for the live GLB viewer, served locally so LAN clients need no internet.
 THREE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'assets', 'app', 'three')
+# glb-shrink pipeline (Node.js), vendored in tools/glb_shrink
+SHRINK_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'tools', 'glb_shrink')
+SHRINK_MAX_BYTES = 200 * 1024 * 1024
+SHRINK_PRESETS = {
+    "📦 最小檔案 — 遠景或畫面上很小": 0,
+    "⚖️ 平衡 — 大多數專案（建議）": 50,
+    "✨ 最清晰 — 近距離或主角物件": 100,
+}
 VIEW_STATIC = "靜態渲染預覽"
 VIEW_LIVE = "即時 3D 檢視"
 LIVE_IDLE_TEXT = "切換到「即時 3D 檢視」時，會自動以目前的減面與貼圖設定匯出 GLB 並載入"
@@ -290,7 +299,106 @@ css = """
 }
 
 /* Live three.js viewer */
-#live-glb-url, #origin-pick-box, #origin-pick-btn { display: none !important; }
+#live-glb-url, #origin-pick-box, #origin-pick-btn, #shrink-view-json { display: none !important; }
+
+/* GLB 壓縮 tab (styled after glb-shrink) */
+.shrink-hero {
+    background: #0b0d14;
+    border-radius: 12px;
+    padding: 18px 16px 16px;
+    text-align: center;
+    color: #e5e7eb;
+}
+.shrink-hero-label {
+    font-size: 12px;
+    letter-spacing: 0.2em;
+    color: #9ca3af;
+    margin-bottom: 6px;
+}
+.shrink-hero-sizes {
+    display: flex;
+    justify-content: center;
+    align-items: baseline;
+    gap: 18px;
+    flex-wrap: wrap;
+    font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-weight: 700;
+    font-size: clamp(32px, 5vw, 60px);
+    line-height: 1.1;
+}
+.shrink-before { color: #f87171; text-decoration: line-through; text-decoration-thickness: 3px; }
+.shrink-before.plain { text-decoration: none; color: #e5e7eb; }
+.shrink-arrow { color: #6b7280; font-size: 0.7em; }
+.shrink-after { color: #4ade80; }
+.shrink-badge {
+    display: inline-block;
+    margin-top: 10px;
+    padding: 4px 14px;
+    border-radius: 999px;
+    background: rgba(74, 222, 128, 0.14);
+    color: #4ade80;
+    font-family: "JetBrains Mono", ui-monospace, monospace;
+    font-weight: 700;
+    font-size: 18px;
+}
+.shrink-hero-sub { margin-top: 8px; font-size: 13px; color: #9ca3af; }
+
+.shrink-viewers {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px;
+    height: 640px;
+}
+@media (max-width: 900px) {
+    .shrink-viewers { grid-template-columns: 1fr; height: auto; }
+    .shrink-card { height: 420px; }
+}
+.shrink-card {
+    position: relative;
+    background: #0e1018;
+    border-radius: 12px;
+    overflow: hidden;
+}
+.shrink-canvas { position: absolute; inset: 0; }
+.shrink-canvas canvas { display: block; width: 100% !important; height: 100% !important; cursor: grab; }
+.shrink-card-header {
+    position: absolute;
+    top: 10px;
+    left: 10px;
+    right: 10px;
+    display: flex;
+    justify-content: space-between;
+    z-index: 5;
+    pointer-events: none;
+}
+.shrink-tag {
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: 0.1em;
+    padding: 3px 10px;
+    border-radius: 999px;
+}
+.shrink-tag.before { color: #f87171; background: rgba(248, 113, 113, 0.15); }
+.shrink-tag.after { color: #4ade80; background: rgba(74, 222, 128, 0.15); }
+.shrink-stat {
+    font-family: "JetBrains Mono", ui-monospace, monospace;
+    font-size: 12px;
+    color: #d1d5db;
+    background: rgba(255, 255, 255, 0.06);
+    padding: 3px 8px;
+    border-radius: 6px;
+}
+.shrink-empty {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #6b7280;
+    font-size: 15px;
+    pointer-events: none;
+}
+.shrink-empty.hidden { display: none; }
 
 body:not(.live-mode) #preview-live { display: none !important; }
 body.live-mode #preview-static { display: none !important; }
@@ -431,6 +539,16 @@ head = """
     import * as THREE from '__THREE_BASE__/three.module.js';
     import { OrbitControls } from '__THREE_BASE__/addons/controls/OrbitControls.js';
     import { GLTFLoader } from '__THREE_BASE__/addons/loaders/GLTFLoader.js';
+    import { DRACOLoader } from '__THREE_BASE__/addons/loaders/DRACOLoader.js';
+
+    // Draco decoder served locally (compressed GLBs from GLB 壓縮 use KHR_draco_mesh_compression)
+    const dracoLoader = new DRACOLoader();
+    dracoLoader.setDecoderPath('__THREE_BASE__/draco/');
+    function makeGltfLoader() {
+        const loader = new GLTFLoader();
+        loader.setDRACOLoader(dracoLoader);
+        return loader;
+    }
     import { RoomEnvironment } from '__THREE_BASE__/addons/environments/RoomEnvironment.js';
 
     const IDLE_TEXT = '__IDLE_TEXT__';
@@ -766,7 +884,7 @@ head = """
         if (!url || !init()) return;
         if (url === V.url && V.model) { setStatus(''); return; }
         setStatus('載入模型中… 0%');
-        new GLTFLoader().load(
+        makeGltfLoader().load(
             url,
             (gltf) => {
                 disposeModel();
@@ -798,6 +916,151 @@ head = """
         V.controls.target.copy(V.home.target);
         V.controls.update();
     }
+
+    // --- GLB 壓縮 before/after viewers: port of glb-shrink's ModelViewer (auto-rotate, framed) ---
+    class CompareViewer {
+        constructor(side) {
+            this.side = side;
+            this.model = null;
+            this.url = null;
+            this.renderer = null;
+        }
+
+        el() { return document.getElementById('shrink-canvas-' + this.side); }
+
+        ensure() {
+            const el = this.el();
+            if (!el) return false;
+            if (this.renderer) {
+                if (this.container !== el) {  // re-mounted by Gradio
+                    this.container = el;
+                    el.prepend(this.renderer.domElement);
+                    this.ro.disconnect();
+                    this.ro.observe(el);
+                }
+                return true;
+            }
+            this.container = el;
+            const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+            renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+            renderer.toneMapping = THREE.ACESFilmicToneMapping;
+            renderer.toneMappingExposure = 1.1;
+            renderer.outputColorSpace = THREE.SRGBColorSpace;
+            el.prepend(renderer.domElement);
+
+            const scene = new THREE.Scene();
+            scene.background = new THREE.Color(0x0e1018);
+            const camera = new THREE.PerspectiveCamera(45, 1, 0.01, 200);
+            camera.position.set(1.8, 1.2, 1.8);
+            const controls = new OrbitControls(camera, renderer.domElement);
+            controls.enableDamping = true;
+            controls.dampingFactor = 0.08;
+            controls.autoRotate = true;
+            controls.autoRotateSpeed = 1.2;
+            const pmrem = new THREE.PMREMGenerator(renderer);
+            scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
+            pmrem.dispose();
+            const key = new THREE.DirectionalLight(0xffffff, 1.4);
+            key.position.set(3, 5, 2);
+            scene.add(key);
+            scene.add(new THREE.AmbientLight(0xffffff, 0.35));
+
+            Object.assign(this, { renderer, scene, camera, controls });
+            this.ro = new ResizeObserver(() => this.resize());
+            this.ro.observe(el);
+            this.resize();
+            renderer.setAnimationLoop(() => {
+                if (!this.container || !this.container.offsetParent) return;
+                controls.update();
+                renderer.render(scene, camera);
+            });
+            return true;
+        }
+
+        resize() {
+            const w = this.container.clientWidth, h = this.container.clientHeight;
+            if (w <= 0 || h <= 0) return;
+            this.renderer.setSize(w, h, false);
+            this.camera.aspect = w / h;
+            this.camera.updateProjectionMatrix();
+        }
+
+        setEmpty(text) {
+            const e = document.getElementById('shrink-empty-' + this.side);
+            if (!e) return;
+            if (text) e.textContent = text;
+            e.classList.toggle('hidden', !text);
+        }
+
+        clear() {
+            if (!this.model) return;
+            this.scene.remove(this.model);
+            this.model.traverse((o) => {
+                if (o.isMesh) {
+                    o.geometry.dispose();
+                    (Array.isArray(o.material) ? o.material : [o.material]).forEach((m) => m.dispose());
+                }
+            });
+            this.model = null;
+        }
+
+        frame(object) {
+            const box = new THREE.Box3().setFromObject(object);
+            const size = box.getSize(new THREE.Vector3());
+            const center = box.getCenter(new THREE.Vector3());
+            const dist = Math.max(size.x, size.y, size.z) * 1.8 || 1;
+            object.position.sub(center);
+            this.camera.near = dist / 200;
+            this.camera.far = dist * 50;
+            this.camera.updateProjectionMatrix();
+            this.camera.position.set(dist * 0.7, dist * 0.55, dist * 0.7);
+            this.controls.target.set(0, 0, 0);
+            this.controls.update();
+        }
+
+        load(url, emptyText, tries = 0) {
+            if (!this.ensure()) {
+                // The tab may not be mounted yet right after switching to it
+                if (tries < 30) setTimeout(() => this.load(url, emptyText, tries + 1), 100);
+                return;
+            }
+            if (!url) {
+                this.clear();
+                this.url = null;
+                this.setEmpty(emptyText);
+                return;
+            }
+            if (url === this.url && this.model) return;
+            this.setEmpty('載入中…');
+            makeGltfLoader().load(
+                url,
+                (gltf) => {
+                    this.clear();
+                    this.model = gltf.scene;
+                    this.frame(this.model);
+                    this.scene.add(this.model);
+                    this.url = url;
+                    this.setEmpty('');
+                },
+                undefined,
+                (err) => this.setEmpty('載入失敗：' + (err && err.message ? err.message : err)),
+            );
+        }
+    }
+
+    const compare = { before: new CompareViewer('before'), after: new CompareViewer('after') };
+    window.shrinkView = {
+        load(payload) {
+            let d = {};
+            try { d = JSON.parse(payload || '{}'); } catch (e) { return; }
+            compare.before.load(d.before, '原始模型');
+            compare.after.load(d.after, '壓縮後預覽');
+            const sb = document.getElementById('shrink-stat-before');
+            const sa = document.getElementById('shrink-stat-after');
+            if (sb) sb.textContent = d.beforeStat || '—';
+            if (sa) sa.textContent = d.afterStat || '—';
+        },
+    };
 
     window.trellisViewer = {
         init, load, clear, resetView, setStatus, togglePick,
@@ -835,6 +1098,23 @@ TOGGLE_VIEW_JS = f"""
 }}
 """
 LOAD_GLB_JS = "(url) => { if (url && window.trellisViewer) window.trellisViewer.load(url); return url; }"
+SHRINK_VIEW_JS = "(v) => { if (window.shrinkView) window.shrinkView.load(v); return v; }"
+
+# Before/after viewers for the GLB 壓縮 tab (layout from glb-shrink)
+shrink_viewers_html = """
+<div class="shrink-viewers">
+    <div class="shrink-card">
+        <div class="shrink-card-header"><span class="shrink-tag before">壓縮前</span><span class="shrink-stat" id="shrink-stat-before">—</span></div>
+        <div class="shrink-canvas" id="shrink-canvas-before"></div>
+        <div class="shrink-empty" id="shrink-empty-before">原始模型</div>
+    </div>
+    <div class="shrink-card">
+        <div class="shrink-card-header"><span class="shrink-tag after">壓縮後</span><span class="shrink-stat" id="shrink-stat-after">—</span></div>
+        <div class="shrink-canvas" id="shrink-canvas-after"></div>
+        <div class="shrink-empty" id="shrink-empty-after">壓縮後預覽</div>
+    </div>
+</div>
+"""
 # Replaces the hidden textbox input with the point picked in the viewer
 PICK_ORIGIN_JS = "(_, ...rest) => [JSON.stringify(window.trellisViewer ? window.trellisViewer.getPicked() : null), ...rest]"
 RESET_VIEW_JS = f"""
@@ -1418,6 +1698,154 @@ def build_raw_glb(
     return glb
 
 
+# ---------------------------------------------------------------------------
+# GLB 壓縮 (glb-shrink integration): the Node pipeline lives in tools/glb_shrink
+# ---------------------------------------------------------------------------
+
+def shrink_hint(quality: float) -> str:
+    """Traditional Chinese version of glb-shrink's getPresetHint()."""
+    q = max(0.0, min(100.0, float(quality)))
+    if q <= 20:
+        return "極小檔案：適合幾乎不會注意到的背景道具。"
+    if q <= 40:
+        return "小檔案：適合場景中較遠的物件。"
+    if q <= 60:
+        return "平衡：大多數專案的最佳選擇。"
+    if q <= 80:
+        return "更多細節：邊緣與貼圖保持較銳利。"
+    return "最高細節：適合近距離觀看，檔案較大。"
+
+
+def format_bytes(n: float) -> str:
+    if n < 1024:
+        return f"{n:.0f} B"
+    if n < 1024 * 1024:
+        return f"{n / 1024:.0f} KB"
+    return f"{n / (1024 * 1024):.1f} MB"
+
+
+def format_tris(n: int) -> str:
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.2f}M 面"
+    if n >= 1_000:
+        return f"{n / 1_000:.1f}k 面"
+    return f"{n} 面"
+
+
+def run_shrink(*args: str) -> dict:
+    """Run tools/glb_shrink/cli.mjs and return its JSON result."""
+    try:
+        proc = subprocess.run(
+            ["node", os.path.join(SHRINK_DIR, "cli.mjs"), *args],
+            cwd=SHRINK_DIR, capture_output=True, text=True, timeout=900,
+        )
+    except FileNotFoundError:
+        raise gr.Error("找不到 Node.js，請先在 WSL 安裝 Node.js 18 以上版本。")
+    except subprocess.TimeoutExpired:
+        raise gr.Error("GLB 壓縮逾時（超過 15 分鐘）。")
+    try:
+        result = json.loads(proc.stdout or "{}")
+    except json.JSONDecodeError:
+        result = {"error": (proc.stderr or proc.stdout or "未知錯誤").strip()[-500:]}
+    if proc.returncode != 0 or "error" in result:
+        raise gr.Error(f"GLB 壓縮失敗：{result.get('error', proc.stderr.strip()[-500:])}")
+    return result
+
+
+def shrink_hero_html(src: Optional[dict] = None, out: Optional[dict] = None) -> str:
+    if not src:
+        return ('<div class="shrink-hero"><div class="shrink-hero-label">檔案大小</div>'
+                '<div class="shrink-hero-sub">上傳 GLB，或在「圖片轉 3D」按「送到 GLB 壓縮」</div></div>')
+    before = format_bytes(src['size'])
+    if not out:
+        return (f'<div class="shrink-hero"><div class="shrink-hero-label">檔案大小</div>'
+                f'<div class="shrink-hero-sizes"><span class="shrink-before plain">{before}</span>'
+                f'<span class="shrink-arrow">→</span><span class="shrink-after">—</span></div>'
+                f'<div class="shrink-badge">可以開始壓縮</div>'
+                f'<div class="shrink-hero-sub">{format_tris(src["tris"])} · 選擇品質後按「壓縮模型」</div></div>')
+    pct = (src['size'] - out['size']) / src['size'] * 100 if src['size'] else 0
+    return (f'<div class="shrink-hero"><div class="shrink-hero-label">檔案大小</div>'
+            f'<div class="shrink-hero-sizes"><span class="shrink-before">{before}</span>'
+            f'<span class="shrink-arrow">→</span><span class="shrink-after">{format_bytes(out["size"])}</span></div>'
+            f'<div class="shrink-badge">−{pct:.0f}% 更小</div>'
+            f'<div class="shrink-hero-sub">{format_tris(src["tris"])} → {format_tris(out["tris"])}'
+            f' · Draco 幾何 + WebP 貼圖</div></div>')
+
+
+def shrink_view_json(src: Optional[dict], out: Optional[dict] = None) -> str:
+    """Payload for the before/after three.js viewers (read by client-side js)."""
+    return json.dumps({
+        'before': f"/gradio_api/file={src['path']}" if src else "",
+        'after': f"/gradio_api/file={out['path']}" if out else "",
+        'beforeStat': format_bytes(src['size']) if src else "—",
+        'afterStat': format_bytes(out['size']) if out else "—",
+    })
+
+
+def shrink_ingest(path: str, name: str, req: gr.Request):
+    """Copy a GLB into the session's shrink folder, inspect it, and reset the output side."""
+    if not name.lower().endswith('.glb'):
+        raise gr.Error("請上傳 .glb 檔案。")
+    if os.path.getsize(path) > SHRINK_MAX_BYTES:
+        raise gr.Error("檔案超過 200 MB 上限。")
+    shrink_dir = os.path.join(TMP_DIR, str(req.session_hash), 'shrink')
+    os.makedirs(shrink_dir, exist_ok=True)
+    src_path = os.path.join(shrink_dir, f"{uuid.uuid4().hex[:8]}_{os.path.basename(name)}")
+    shutil.copyfile(path, src_path)
+    info = run_shrink("inspect", src_path)
+    src = {'path': src_path, 'name': os.path.basename(name), 'size': info['fileSize'], 'tris': info['tris']}
+    meta = f"**{src['name']}**　`{format_tris(src['tris'])} · {format_bytes(src['size'])}`"
+    return src, shrink_hero_html(src), shrink_view_json(src), meta, gr.update(value=None, visible=False)
+
+
+def shrink_upload(file_path: Optional[str], req: gr.Request):
+    if not file_path:
+        return None, shrink_hero_html(), shrink_view_json(None), "", gr.update(value=None, visible=False)
+    return shrink_ingest(file_path, os.path.basename(file_path), req)
+
+
+def shrink_compress(src: Optional[dict], quality: float, req: gr.Request, progress=gr.Progress()):
+    if not src:
+        raise gr.Error("請先上傳 GLB 檔案。")
+    progress(0.1, desc="壓縮中…（減面 → WebP 貼圖 → Draco）")
+    stem = re.sub(r'\.glb$', '', src['name'], flags=re.IGNORECASE)
+    out_path = os.path.join(os.path.dirname(src['path']), f"{uuid.uuid4().hex[:8]}", f"{stem}-draco.glb")
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    result = run_shrink("compress", src['path'], out_path, str(int(quality)))
+    out = {'path': out_path, 'size': result['outputSize'], 'tris': result['stats']['finalTris']}
+    return shrink_hero_html(src, out), shrink_view_json(src, out), gr.update(value=out_path, visible=True)
+
+
+def send_to_shrink(
+    state: dict,
+    decimation_target: int,
+    texture_size: int,
+    scale_mode: str,
+    target_cm: float,
+    rot_x: float,
+    rot_y: float,
+    rot_z: float,
+    keep_parts: List[str],
+    origin_mode: str,
+    origin_point: Optional[List[float]],
+    origin_dx: float,
+    origin_dy: float,
+    origin_dz: float,
+    glb_cache: Optional[dict],
+    req: gr.Request,
+    progress=gr.Progress(track_tqdm=True),
+):
+    """Export the current (edited) GLB if needed and open it in the GLB 壓縮 tab."""
+    if state is None:
+        raise gr.Error("請先按「生成」建立 3D 素材。")
+    edit = make_edit(scale_mode, target_cm, rot_x, rot_y, rot_z, keep_parts, origin_mode, origin_point,
+                     origin_dx, origin_dy, origin_dz)
+    glb_cache = get_or_export_glb(state, decimation_target, texture_size, edit, glb_cache, req)
+    name = f"trellis_{datetime.now():%Y%m%d_%H%M%S}.glb"
+    # Clear the upload widget so it does not show a previously uploaded file
+    return (glb_cache, gr.Tabs(selected="shrink"), None, *shrink_ingest(glb_cache['path'], name, req))
+
+
 with gr.Blocks(delete_cache=(600, 600), title="TRELLIS.2 圖片轉 3D") as demo:
     gr.Markdown("""
     ## 使用 [TRELLIS.2](https://microsoft.github.io/TRELLIS.2) 將圖片轉成 3D 素材
@@ -1426,89 +1854,119 @@ with gr.Blocks(delete_cache=(600, 600), title="TRELLIS.2 圖片轉 3D") as demo:
     * *註：上傳的圖片只會暫存在本機伺服器，工作階段結束後即刪除，不會上傳到任何外部服務。*
     """)
 
-    with gr.Row():
-        with gr.Column(scale=1, min_width=360):
-            image_prompt = gr.Image(label="輸入圖片", format="png", image_mode="RGBA", type="pil", sources=["upload", "clipboard"], height=400)
+    with gr.Tabs(selected="gen") as tabs:
+        with gr.Tab("圖片轉 3D", id="gen"):
+            with gr.Row():
+                with gr.Column(scale=1, min_width=360):
+                    image_prompt = gr.Image(label="輸入圖片", format="png", image_mode="RGBA", type="pil", sources=["upload", "clipboard"], height=400)
 
-            resolution = gr.Radio(["512", "1024", "1536"], label="解析度", value="1024",
-                                  info="1536 生成約 2 分鐘、匯出 GLB 約 5 分鐘（會用滿 32GB 顯存）；1024 約 45 秒 + 30 秒")
-            seed = gr.Slider(0, MAX_SEED, label="隨機種子", value=0, step=1)
-            randomize_seed = gr.Checkbox(label="每次隨機產生種子", value=True)
-            decimation_target = gr.Slider(100000, 1000000, label="減面目標（面數）", value=500000, step=10000)
-            texture_size = gr.Slider(1024, 4096, label="貼圖尺寸", value=2048, step=1024)
+                    resolution = gr.Radio(["512", "1024", "1536"], label="解析度", value="1024",
+                                          info="1536 生成約 2 分鐘、匯出 GLB 約 5 分鐘（會用滿 32GB 顯存）；1024 約 45 秒 + 30 秒")
+                    seed = gr.Slider(0, MAX_SEED, label="隨機種子", value=0, step=1)
+                    randomize_seed = gr.Checkbox(label="每次隨機產生種子", value=True)
+                    decimation_target = gr.Slider(100000, 1000000, label="減面目標（面數）", value=500000, step=10000)
+                    texture_size = gr.Slider(1024, 4096, label="貼圖尺寸", value=2048, step=1024)
 
-            with gr.Accordion(label="GLB 編輯（部件、尺寸、方向、原點）", open=True):
-                gr.Markdown("匯出 GLB（或切換到即時 3D 檢視）後即可編輯，每次調整約 1–3 秒自動重新匯出。"
-                            "**建議上傳單一視角的圖片**：整張三視圖會被當成三個物件生成，每個只分到約 1/3 的解析度。")
-                keep_parts = gr.CheckboxGroup([], label="保留的部件",
-                                              info="空間上分開的物件會自動分成部件（編號標示在即時 3D 檢視中），取消勾選即刪除")
-                with gr.Row():
-                    scale_mode = gr.Dropdown(SCALE_MODES, value=SCALE_NONE, label="縮放依據", min_width=160)
-                    target_cm = gr.Number(value=100, minimum=0.1, label="目標長度（cm）", min_width=120)
-                with gr.Row():
-                    rot_x = gr.Number(value=0, step=1, label="繞 X 軸旋轉（°）", min_width=100)
-                    rot_y = gr.Number(value=0, step=1, label="繞 Y 軸旋轉（°）", min_width=100)
-                    rot_z = gr.Number(value=0, step=1, label="繞 Z 軸旋轉（°）", min_width=100)
-                gr.Markdown("*旋轉可輸入任意角度（可含小數、負數），按 Enter 或點到其他地方即套用；依右手定則，正值為逆時針。*")
-                origin_mode = gr.Dropdown(ORIGIN_MODES, value=ORIGIN_CENTER, label="原點位置",
-                                          info="自訂：在即時 3D 檢視按「設定原點」再點選模型表面（例如關節處）")
-                with gr.Row():
-                    origin_dx = gr.Number(value=0, step=0.1, label="原點微調 X（cm）", min_width=100)
-                    origin_dy = gr.Number(value=0, step=0.1, label="原點微調 Y（cm）", min_width=100)
-                    origin_dz = gr.Number(value=0, step=0.1, label="原點微調 Z（cm）", min_width=100)
-                with gr.Row():
-                    gr.Markdown("*微調：在上方位置的基礎上，沿最終的 X/Y/Z 軸移動原點（例如 Y = 2.5 表示原點往上 2.5 cm）；點選模型設定原點時會自動歸零。*")
-                    origin_offset_reset = gr.Button("微調歸零", size="sm", scale=0, min_width=90)
-                gr.Markdown("*套用順序：保留部件 → 旋轉 → 等比例縮放 → 移動原點。*")
+                    with gr.Accordion(label="GLB 編輯（部件、尺寸、方向、原點）", open=True):
+                        gr.Markdown("匯出 GLB（或切換到即時 3D 檢視）後即可編輯，每次調整約 1–3 秒自動重新匯出。"
+                                    "**建議上傳單一視角的圖片**：整張三視圖會被當成三個物件生成，每個只分到約 1/3 的解析度。")
+                        keep_parts = gr.CheckboxGroup([], label="保留的部件",
+                                                      info="空間上分開的物件會自動分成部件（編號標示在即時 3D 檢視中），取消勾選即刪除")
+                        with gr.Row():
+                            scale_mode = gr.Dropdown(SCALE_MODES, value=SCALE_NONE, label="縮放依據", min_width=160)
+                            target_cm = gr.Number(value=100, minimum=0.1, label="目標長度（cm）", min_width=120)
+                        with gr.Row():
+                            rot_x = gr.Number(value=0, step=1, label="繞 X 軸旋轉（°）", min_width=100)
+                            rot_y = gr.Number(value=0, step=1, label="繞 Y 軸旋轉（°）", min_width=100)
+                            rot_z = gr.Number(value=0, step=1, label="繞 Z 軸旋轉（°）", min_width=100)
+                        gr.Markdown("*旋轉可輸入任意角度（可含小數、負數），按 Enter 或點到其他地方即套用；依右手定則，正值為逆時針。*")
+                        origin_mode = gr.Dropdown(ORIGIN_MODES, value=ORIGIN_CENTER, label="原點位置",
+                                                  info="自訂：在即時 3D 檢視按「設定原點」再點選模型表面（例如關節處）")
+                        with gr.Row():
+                            origin_dx = gr.Number(value=0, step=0.1, label="原點微調 X（cm）", min_width=100)
+                            origin_dy = gr.Number(value=0, step=0.1, label="原點微調 Y（cm）", min_width=100)
+                            origin_dz = gr.Number(value=0, step=0.1, label="原點微調 Z（cm）", min_width=100)
+                        with gr.Row():
+                            gr.Markdown("*微調：在上方位置的基礎上，沿最終的 X/Y/Z 軸移動原點（例如 Y = 2.5 表示原點往上 2.5 cm）；點選模型設定原點時會自動歸零。*")
+                            origin_offset_reset = gr.Button("微調歸零", size="sm", scale=0, min_width=90)
+                        gr.Markdown("*套用順序：保留部件 → 旋轉 → 等比例縮放 → 移動原點。*")
 
-            generate_btn = gr.Button("生成", variant="primary")
+                    generate_btn = gr.Button("生成", variant="primary")
 
-            with gr.Accordion(label="進階設定", open=False):
-                gr.Markdown("階段 1：稀疏結構生成")
-                with gr.Row():
-                    ss_guidance_strength = gr.Slider(1.0, 10.0, label="引導強度", value=7.5, step=0.1)
-                    ss_guidance_rescale = gr.Slider(0.0, 1.0, label="引導重新縮放", value=0.7, step=0.01)
-                    ss_sampling_steps = gr.Slider(1, 50, label="取樣步數", value=12, step=1)
-                    ss_rescale_t = gr.Slider(1.0, 6.0, label="時間重新縮放（Rescale T）", value=5.0, step=0.1)
-                gr.Markdown("階段 2：形狀生成")
-                with gr.Row():
-                    shape_slat_guidance_strength = gr.Slider(1.0, 10.0, label="引導強度", value=7.5, step=0.1)
-                    shape_slat_guidance_rescale = gr.Slider(0.0, 1.0, label="引導重新縮放", value=0.5, step=0.01)
-                    shape_slat_sampling_steps = gr.Slider(1, 50, label="取樣步數", value=12, step=1)
-                    shape_slat_rescale_t = gr.Slider(1.0, 6.0, label="時間重新縮放（Rescale T）", value=3.0, step=0.1)
-                gr.Markdown("階段 3：材質生成")
-                with gr.Row():
-                    tex_slat_guidance_strength = gr.Slider(1.0, 10.0, label="引導強度", value=1.0, step=0.1)
-                    tex_slat_guidance_rescale = gr.Slider(0.0, 1.0, label="引導重新縮放", value=0.0, step=0.01)
-                    tex_slat_sampling_steps = gr.Slider(1, 50, label="取樣步數", value=12, step=1)
-                    tex_slat_rescale_t = gr.Slider(1.0, 6.0, label="時間重新縮放（Rescale T）", value=3.0, step=0.1)
+                    with gr.Accordion(label="進階設定", open=False):
+                        gr.Markdown("階段 1：稀疏結構生成")
+                        with gr.Row():
+                            ss_guidance_strength = gr.Slider(1.0, 10.0, label="引導強度", value=7.5, step=0.1)
+                            ss_guidance_rescale = gr.Slider(0.0, 1.0, label="引導重新縮放", value=0.7, step=0.01)
+                            ss_sampling_steps = gr.Slider(1, 50, label="取樣步數", value=12, step=1)
+                            ss_rescale_t = gr.Slider(1.0, 6.0, label="時間重新縮放（Rescale T）", value=5.0, step=0.1)
+                        gr.Markdown("階段 2：形狀生成")
+                        with gr.Row():
+                            shape_slat_guidance_strength = gr.Slider(1.0, 10.0, label="引導強度", value=7.5, step=0.1)
+                            shape_slat_guidance_rescale = gr.Slider(0.0, 1.0, label="引導重新縮放", value=0.5, step=0.01)
+                            shape_slat_sampling_steps = gr.Slider(1, 50, label="取樣步數", value=12, step=1)
+                            shape_slat_rescale_t = gr.Slider(1.0, 6.0, label="時間重新縮放（Rescale T）", value=3.0, step=0.1)
+                        gr.Markdown("階段 3：材質生成")
+                        with gr.Row():
+                            tex_slat_guidance_strength = gr.Slider(1.0, 10.0, label="引導強度", value=1.0, step=0.1)
+                            tex_slat_guidance_rescale = gr.Slider(0.0, 1.0, label="引導重新縮放", value=0.0, step=0.01)
+                            tex_slat_sampling_steps = gr.Slider(1, 50, label="取樣步數", value=12, step=1)
+                            tex_slat_rescale_t = gr.Slider(1.0, 6.0, label="時間重新縮放（Rescale T）", value=3.0, step=0.1)
 
-        with gr.Column(scale=10):
-            with gr.Walkthrough(selected=0) as walkthrough:
-                with gr.Step("預覽", id=0):
-                    view_mode = gr.Radio([VIEW_STATIC, VIEW_LIVE], value=VIEW_STATIC, show_label=False, container=False)
-                    preview_output = gr.HTML(empty_html, label="3D 素材預覽", show_label=True, container=True, elem_id="preview-static")
-                    live_view = gr.HTML(live_viewer_html, label="即時 3D 檢視（three.js）", show_label=True, container=True, elem_id="preview-live")
-                    extract_btn = gr.Button("匯出 GLB")
-                with gr.Step("匯出", id=1):
-                    glb_output = gr.Model3D(label="已匯出的 GLB", height=724, show_label=True, display_mode="solid", clear_color=(0.25, 0.25, 0.25, 1.0))
-                    download_btn = gr.DownloadButton(label="下載 GLB")
-                    dims_md = gr.Markdown("")
-                    gr.Markdown("*匯出 GLB 需要重新網格化、減面與材質烘焙，通常需要半分鐘以上，請耐心等候。*")
+                with gr.Column(scale=10):
+                    with gr.Walkthrough(selected=0) as walkthrough:
+                        with gr.Step("預覽", id=0):
+                            view_mode = gr.Radio([VIEW_STATIC, VIEW_LIVE], value=VIEW_STATIC, show_label=False, container=False)
+                            preview_output = gr.HTML(empty_html, label="3D 素材預覽", show_label=True, container=True, elem_id="preview-static")
+                            live_view = gr.HTML(live_viewer_html, label="即時 3D 檢視（three.js）", show_label=True, container=True, elem_id="preview-live")
+                            with gr.Row():
+                                extract_btn = gr.Button("匯出 GLB")
+                                to_shrink_btn = gr.Button("送到 GLB 壓縮 ➜")
+                        with gr.Step("匯出", id=1):
+                            glb_output = gr.Model3D(label="已匯出的 GLB", height=724, show_label=True, display_mode="solid", clear_color=(0.25, 0.25, 0.25, 1.0))
+                            download_btn = gr.DownloadButton(label="下載 GLB")
+                            dims_md = gr.Markdown("")
+                            to_shrink_btn2 = gr.Button("送到 GLB 壓縮 ➜")
+                            gr.Markdown("*匯出 GLB 需要重新網格化、減面與材質烘焙，通常需要半分鐘以上，請耐心等候。*")
 
-        with gr.Column(scale=1, min_width=172):
-            examples = gr.Examples(
-                examples=[
-                    f'assets/example_image/{image}'
-                    for image in sorted(os.listdir("assets/example_image"))
-                ],
-                inputs=[image_prompt],
-                fn=preprocess_image,
-                outputs=[image_prompt],
-                run_on_click=True,
-                examples_per_page=18,
-                label="範例",
-            )
+                with gr.Column(scale=1, min_width=172):
+                    examples = gr.Examples(
+                        examples=[
+                            f'assets/example_image/{image}'
+                            for image in sorted(os.listdir("assets/example_image"))
+                        ],
+                        inputs=[image_prompt],
+                        fn=preprocess_image,
+                        outputs=[image_prompt],
+                        run_on_click=True,
+                        examples_per_page=18,
+                        label="範例",
+                    )
+
+        with gr.Tab("GLB 壓縮", id="shrink"):
+            # Mirrors github.com/lorenhsu1128/glb-shrink: hero strip, controls, before/after viewers
+            shrink_hero = gr.HTML(shrink_hero_html(), elem_id="shrink-hero")
+            with gr.Row():
+                with gr.Column(scale=1, min_width=320):
+                    gr.Markdown("### ◆ GLB 壓縮\nDraco + WebP 壓縮，產出適合遊戲、App、AR/VR 與網頁的輕量 3D 素材")
+                    shrink_file = gr.File(label="拖放 GLB 檔（或點擊瀏覽 · 最大 200 MB）", file_types=[".glb"],
+                                          type="filepath", height=140)
+                    shrink_meta = gr.Markdown("")
+                    shrink_preset = gr.Radio(list(SHRINK_PRESETS), value=list(SHRINK_PRESETS)[1], label="要多清晰？")
+                    shrink_quality = gr.Slider(0, 100, value=50, step=1, label="檔案更小 ↔ 外觀更清晰")
+                    shrink_hint_md = gr.Markdown(shrink_hint(50))
+                    shrink_btn = gr.Button("壓縮模型", variant="primary")
+                    shrink_download = gr.DownloadButton("下載壓縮後的 GLB", visible=False)
+                    gr.Markdown(
+                        "*流程：移除舊壓縮擴充 → 合併頂點 → meshoptimizer 減面 → 重算平滑法線 → "
+                        "貼圖轉 WebP 並縮小 → Draco 幾何壓縮。輸出使用 `KHR_draco_mesh_compression` 與 "
+                        "`EXT_texture_webp`，three.js 載入需搭配 `DRACOLoader`。*\n\n"
+                        "*TRELLIS 生成的模型因 UV 接縫多，面數主要由「圖片轉 3D」的「減面目標」決定，"
+                        "glb-shrink 主要壓縮檔案大小。*"
+                    )
+                with gr.Column(scale=3):
+                    gr.HTML(shrink_viewers_html)
+
                     
     output_buf = gr.State()
     glb_cache = gr.State()  # GLB exported for the current generation: {'key': [decimation, texture], 'path': str}
@@ -1518,6 +1976,8 @@ with gr.Blocks(delete_cache=(600, 600), title="TRELLIS.2 圖片轉 3D") as demo:
     # Hidden channel for the point clicked in the live viewer ("設定原點")
     origin_pick_box = gr.Textbox(elem_id="origin-pick-box", container=False, show_label=False)
     origin_pick_btn = gr.Button("origin-pick", elem_id="origin-pick-btn")
+    shrink_src = gr.State()  # {'path', 'name', 'size', 'tris'} of the GLB loaded in the GLB 壓縮 tab
+    shrink_view = gr.Textbox(elem_id="shrink-view-json", container=False, show_label=False)  # viewer payload
 
 
     # Handlers
@@ -1604,6 +2064,37 @@ with gr.Blocks(delete_cache=(600, 600), title="TRELLIS.2 圖片轉 3D") as demo:
         inputs=export_inputs,
         outputs=[glb_output, download_btn, glb_cache, dims_md, keep_parts],
     )
+
+    # --- GLB 壓縮 tab ---
+    shrink_ingest_outputs = [shrink_src, shrink_hero, shrink_view, shrink_meta, shrink_download]
+    load_shrink_view = dict(
+        fn=lambda v: gr.skip(), inputs=[shrink_view], outputs=[shrink_view], js=SHRINK_VIEW_JS,
+    )
+
+    shrink_file.upload(shrink_upload, inputs=[shrink_file], outputs=shrink_ingest_outputs).then(**load_shrink_view)
+    shrink_file.clear(shrink_upload, inputs=[shrink_file], outputs=shrink_ingest_outputs).then(**load_shrink_view)
+
+    # Preset cards <-> fine-tune slider, as in glb-shrink
+    shrink_preset.input(
+        lambda p: (SHRINK_PRESETS[p], shrink_hint(SHRINK_PRESETS[p])),
+        inputs=[shrink_preset], outputs=[shrink_quality, shrink_hint_md],
+    )
+    shrink_quality.input(
+        lambda q: (next((k for k, v in SHRINK_PRESETS.items() if v == int(q)), None), shrink_hint(q)),
+        inputs=[shrink_quality], outputs=[shrink_preset, shrink_hint_md],
+    )
+
+    shrink_btn.click(
+        shrink_compress, inputs=[shrink_src, shrink_quality], outputs=[shrink_hero, shrink_view, shrink_download],
+    ).then(**load_shrink_view)
+
+    # Send the edited model from 圖片轉 3D straight into GLB 壓縮
+    for btn in [to_shrink_btn, to_shrink_btn2]:
+        btn.click(
+            send_to_shrink,
+            inputs=export_inputs,
+            outputs=[glb_cache, tabs, shrink_file, *shrink_ingest_outputs],
+        ).then(**load_shrink_view)
         
 
 # Launch the Gradio app
@@ -1641,4 +2132,5 @@ if __name__ == "__main__":
         css=css, head=head,
         server_name=SERVER_NAME, server_port=SERVER_PORT,
         allowed_paths=[TMP_DIR, THREE_DIR],
+        max_file_size="200mb",  # glb-shrink's upload limit
     )

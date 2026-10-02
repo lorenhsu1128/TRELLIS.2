@@ -9,6 +9,11 @@ export PYTHONUNBUFFERED=1 GRADIO_ANALYTICS_ENABLED=False
 # Fixed mmap threshold: large tensor buffers are mmapped and returned to the OS when freed
 # (glibc otherwise raises the threshold dynamically and the heap fragments until OOM)
 export MALLOC_MMAP_THRESHOLD_=1048576 MALLOC_TRIM_THRESHOLD_=67108864
+# GLB 壓縮 tab: Node.js deps of the vendored glb-shrink pipeline
+if command -v node >/dev/null && [ ! -d tools/glb_shrink/node_modules ]; then
+  echo "安裝 GLB 壓縮所需的 Node.js 套件…"
+  (cd tools/glb_shrink && npm install --no-audit --no-fund --loglevel=error)
+fi
 echo "============================================================"
 echo " TRELLIS.2 圖片轉 3D 啟動中（首次載入模型約需 1 分鐘）"
 echo " 本機：      http://localhost:${APP_PORT}"

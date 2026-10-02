@@ -1,0 +1,19 @@
+{
+  "name": "trellis2-glb-shrink",
+  "version": "1.0.0",
+  "description": "GLB compression pipeline vendored from github.com/lorenhsu1128/glb-shrink (commit 0a70bb3), called by app_zh.py",
+  "type": "module",
+  "private": true,
+  "license": "MIT",
+  "dependencies": {
+    "@gltf-transform/core": "^4.3.0",
+    "@gltf-transform/extensions": "^4.3.0",
+    "@gltf-transform/functions": "^4.3.0",
+    "draco3dgltf": "^1.5.7",
+    "meshoptimizer": "^1.1.1",
+    "sharp": "^0.34.5"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
