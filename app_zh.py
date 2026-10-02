@@ -163,7 +163,7 @@ css = """
     position: relative;
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
     width: 100%;
-    height: 722px;
+    height: clamp(420px, calc(100vh - 380px), 722px);  /* fit the sticky middle panel */
     margin: 0 auto;
     padding: 20px;
     display: flex;
@@ -309,6 +309,25 @@ css = """
 /* Live three.js viewer */
 #live-glb-url, #origin-pick-box, #origin-pick-btn, #shrink-view-json { display: none !important; }
 
+/* 圖片轉 3D: three panels. Side panels stick to the viewport and scroll on their own,
+   so the preview in the middle stays visible while adjusting parameters. */
+#col-left, #col-mid, #col-right {
+    position: sticky;
+    top: 8px;
+    align-self: flex-start;
+}
+#col-left, #col-mid, #col-right {
+    max-height: calc(100vh - 16px);
+    overflow-y: auto;
+    overflow-x: hidden;
+    overscroll-behavior: contain;
+    padding-right: 4px;
+    /* Gradio columns wrap by default: with a max-height, overflowing children would
+       wrap into a second column instead of scrolling */
+    flex-wrap: nowrap !important;
+}
+#col-left > *, #col-mid > *, #col-right > * { flex-shrink: 0; }
+
 /* GLB 壓縮 tab (styled after glb-shrink) */
 .shrink-hero {
     background: #0b0d14;
@@ -418,7 +437,7 @@ body.live-mode #preview-static { display: none !important; }
 .live-viewer-container {
     position: relative;
     width: 100%;
-    height: 722px;
+    height: clamp(420px, calc(100vh - 380px), 722px);  /* fit the sticky middle panel */
     overflow: hidden;
     border-radius: var(--block-radius);
     background: #404040;
@@ -1990,7 +2009,8 @@ with gr.Blocks(delete_cache=(600, 600), title="TRELLIS.2 圖片轉 3D") as demo:
     with gr.Tabs(selected="gen") as tabs:
         with gr.Tab("圖片轉 3D", id="gen"):
             with gr.Row():
-                with gr.Column(scale=4, min_width=400):  # wider: parameters carry long explanations
+                # Three panels: input/generation | preview | editing & settings (side panels scroll independently)
+                with gr.Column(scale=3, min_width=320, elem_id="col-left"):
                     image_prompt = gr.Image(label="輸入圖片", format="png", image_mode="RGBA", type="pil", sources=["upload", "clipboard"], height=400)
                     gr.Markdown(
                         "*上傳後會自動去背並裁切到物件範圍。若圖片已有透明背景（PNG 帶 alpha），會直接使用不再去背。"
@@ -2015,10 +2035,13 @@ with gr.Blocks(delete_cache=(600, 600), title="TRELLIS.2 圖片轉 3D") as demo:
                              "取消勾選：使用上方固定的種子（重現或微調參數比較差異）。",
                     )
                     decimation_target = gr.Slider(
-                        100000, 1000000, label="減面目標（面數）", value=500000, step=10000,
-                        info="匯出 GLB 時重新網格化後要保留的三角面數上限。"
+                        10, 1000000, label="減面目標（面數）", value=500000, step=10,
+                        info="匯出 GLB 時重新網格化後要保留的三角面數上限（可直接在右側數字框輸入）。"
                              "越高：細節越多、檔案越大、遊戲中渲染越吃效能；越低：越輕量但小細節會被抹平。"
-                             "遊戲用建議 10～30 萬，展示用 50～100 萬。也是 GLB 壓縮能降到多少面數的主要因素。",
+                             "下限 10 是實測仍可運算的最低值，但形狀會隨面數急速崩壞：約 2 萬面仍完整、"
+                             "5 千面大致完整、1 千面細部開始消失、100 面以下嚴重變形。"
+                             "遊戲角色/機甲部件建議 1～5 萬（主角可到 10～30 萬），展示用 50～100 萬。"
+                             "也是 GLB 壓縮能降到多少面數的主要因素。",
                     )
                     texture_size = gr.Slider(
                         1024, 4096, label="貼圖尺寸", value=2048, step=1024,
@@ -2027,6 +2050,35 @@ with gr.Blocks(delete_cache=(600, 600), title="TRELLIS.2 圖片轉 3D") as demo:
                              "1024 適合遠景或小物件、2048 為一般建議、4096 適合主角近拍。",
                     )
 
+                    generate_btn = gr.Button("生成", variant="primary")
+
+                with gr.Column(scale=6, min_width=480, elem_id="col-mid"):
+                    with gr.Walkthrough(selected=0) as walkthrough:
+                        with gr.Step("預覽", id=0):
+                            candidate_pick = gr.Radio(
+                                [], label="候選模型",
+                                info="「專家設定 → 一次生成幾個候選」大於 1 時，可在這裡切換要使用哪一個（會重設 GLB 編輯狀態）。",
+                            )
+                            view_mode = gr.Radio(
+                                [VIEW_STATIC, VIEW_LIVE], value=VIEW_STATIC, label="預覽方式",
+                                info="靜態渲染預覽：生成後立即可看，6 種渲染模式 × 8 個視角；"
+                                     "即時 3D 檢視：自動匯出 GLB（約 30 秒）後用 three.js 自由旋轉縮放，並可使用 GLB 編輯功能。",
+                            )
+                            preview_output = gr.HTML(empty_html, label="3D 素材預覽", show_label=True, container=True, elem_id="preview-static")
+                            live_view = gr.HTML(live_viewer_html, label="即時 3D 檢視（three.js）", show_label=True, container=True, elem_id="preview-live")
+                            with gr.Row():
+                                extract_btn = gr.Button("匯出 GLB")
+                                to_shrink_btn = gr.Button("送到 GLB 壓縮 ➜")
+                            gr.Markdown("*「匯出 GLB」：依目前的減面、貼圖、GLB 編輯與專家設定輸出可下載的 GLB；"
+                                        "「送到 GLB 壓縮」：把目前編輯好的模型帶到 GLB 壓縮分頁做 Draco + WebP 壓縮。*")
+                        with gr.Step("匯出", id=1):
+                            glb_output = gr.Model3D(label="已匯出的 GLB", height=724, show_label=True, display_mode="solid", clear_color=(0.25, 0.25, 0.25, 1.0))
+                            download_btn = gr.DownloadButton(label="下載 GLB")
+                            dims_md = gr.Markdown("")
+                            to_shrink_btn2 = gr.Button("送到 GLB 壓縮 ➜")
+                            gr.Markdown("*匯出 GLB 需要重新網格化、減面與材質烘焙，通常需要半分鐘以上，請耐心等候。*")
+
+                with gr.Column(scale=3, min_width=340, elem_id="col-right"):
                     with gr.Accordion(label="GLB 編輯（部件、尺寸、方向、原點）", open=True):
                         gr.Markdown("匯出 GLB（或切換到即時 3D 檢視）後即可編輯，每次調整約 1–3 秒自動重新匯出。"
                                     "*套用順序：保留部件 → 旋轉 → 等比例縮放 → 移動原點。*")
@@ -2036,17 +2088,16 @@ with gr.Blocks(delete_cache=(600, 600), title="TRELLIS.2 圖片轉 3D") as demo:
                                  "編號會以黃色數字標示在即時 3D 檢視中。取消勾選即從 GLB 刪除該部件，"
                                  "例如三視圖生成的三個模型只保留一個。至少需保留一個。",
                         )
-                        with gr.Row():
-                            scale_mode = gr.Dropdown(
-                                SCALE_MODES, value=SCALE_NONE, label="縮放依據", min_width=160,
-                                info="TRELLIS 會把每個模型正規化成最長邊約 100 cm，不同部件比例不一致。"
-                                     "選擇以哪一軸為基準，等比例縮放成右側指定的實際長度（旋轉後的軸向）。",
-                            )
-                            target_cm = gr.Number(
-                                value=100, minimum=0.1, label="目標長度（cm）", min_width=120,
-                                info="縮放依據那一軸要變成的實際長度。GLB 單位為公尺，three.js 中 1 單位 = 1 m。"
-                                     "按 Enter 或點到其他地方套用。",
-                            )
+                        scale_mode = gr.Dropdown(
+                            SCALE_MODES, value=SCALE_NONE, label="縮放依據", min_width=160,
+                            info="TRELLIS 會把每個模型正規化成最長邊約 100 cm，不同部件比例不一致。"
+                                 "選擇以哪一軸為基準，等比例縮放成右側指定的實際長度（旋轉後的軸向）。",
+                        )
+                        target_cm = gr.Number(
+                            value=100, minimum=0.1, label="目標長度（cm）", min_width=120,
+                            info="縮放依據那一軸要變成的實際長度。GLB 單位為公尺，three.js 中 1 單位 = 1 m。"
+                                 "按 Enter 或點到其他地方套用。",
+                        )
                         with gr.Row():
                             rot_x = gr.Number(value=0, step=1, label="繞 X 軸旋轉（°）", min_width=100,
                                               info="繞紅色 X 軸旋轉，常用於把向前/向後倒的模型扶正。")
@@ -2074,8 +2125,6 @@ with gr.Blocks(delete_cache=(600, 600), title="TRELLIS.2 圖片轉 3D") as demo:
                             gr.Markdown("*微調是在上方原點位置的基礎上，沿最終（旋轉、縮放後）的軸向移動；"
                                         "點選模型設定原點時會自動歸零。即時 3D 檢視左上角會顯示模型相對原點的範圍。*")
                             origin_offset_reset = gr.Button("微調歸零", size="sm", scale=0, min_width=90)
-
-                    generate_btn = gr.Button("生成", variant="primary")
 
                     with gr.Accordion(label="進階設定（三階段取樣參數）", open=False):
                         gr.Markdown(
@@ -2157,27 +2206,25 @@ with gr.Blocks(delete_cache=(600, 600), title="TRELLIS.2 圖片轉 3D") as demo:
                             info="重新網格化後，把頂點往原始高解析表面拉回的程度。0：維持重建後較圓滑的表面（預設）；"
                                  "越接近 1：稜角、刻線越銳利，適合機甲、武器等硬邊造型，但可能出現細小鋸齒。建議硬邊模型試 0.6～0.9。",
                         )
-                        with gr.Row():
-                            exp_cone_deg = gr.Slider(
-                                10, 180, value=90, step=5, label="UV 分塊角度（°）",
-                                info="UV 展開時，表面法線方向差異在此角度內的面會分在同一塊。"
-                                     "調大：UV 塊數與接縫變少，貼圖空間利用率較高，但大塊 UV 的貼圖可能較扭曲；"
-                                     "調小：接縫多但每塊扭曲小。實測對 GLB 壓縮後的面數影響很小（90°→150° 約少 2%），"
-                                     "匯出時間略增。預設 90。",
-                            )
-                            exp_smooth = gr.Slider(
-                                0, 10, value=1, step=0.5, label="UV 分塊平滑度",
-                                info="分塊邊界的平滑強度。調高可讓分塊邊界更整齊、減少零碎小塊。預設 1。",
-                            )
-                        with gr.Row():
-                            exp_refine_iters = gr.Slider(
-                                0, 10, value=0, step=1, label="UV 分塊細化次數",
-                                info="對分塊結果做局部細化的次數。增加可減少不規則的小碎塊，匯出時間略增。預設 0。",
-                            )
-                            exp_global_iters = gr.Slider(
-                                1, 10, value=1, step=1, label="UV 分塊全域迭代次數",
-                                info="整體重新分配分塊的次數。增加可讓分塊更合理、塊數更少，匯出時間略增。預設 1。",
-                            )
+                        exp_cone_deg = gr.Slider(
+                            10, 180, value=90, step=5, label="UV 分塊角度（°）",
+                            info="UV 展開時，表面法線方向差異在此角度內的面會分在同一塊。"
+                                 "調大：UV 塊數與接縫變少，貼圖空間利用率較高，但大塊 UV 的貼圖可能較扭曲；"
+                                 "調小：接縫多但每塊扭曲小。實測對 GLB 壓縮後的面數影響很小（90°→150° 約少 2%），"
+                                 "匯出時間略增。預設 90。",
+                        )
+                        exp_smooth = gr.Slider(
+                            0, 10, value=1, step=0.5, label="UV 分塊平滑度",
+                            info="分塊邊界的平滑強度。調高可讓分塊邊界更整齊、減少零碎小塊。預設 1。",
+                        )
+                        exp_refine_iters = gr.Slider(
+                            0, 10, value=0, step=1, label="UV 分塊細化次數",
+                            info="對分塊結果做局部細化的次數。增加可減少不規則的小碎塊，匯出時間略增。預設 0。",
+                        )
+                        exp_global_iters = gr.Slider(
+                            1, 10, value=1, step=1, label="UV 分塊全域迭代次數",
+                            info="整體重新分配分塊的次數。增加可讓分塊更合理、塊數更少，匯出時間略增。預設 1。",
+                        )
                         exp_alpha_mode = gr.Dropdown(
                             list(ALPHA_MODES), value=list(ALPHA_MODES)[0], label="透明度模式",
                             info="TRELLIS 會烘焙出透明度，但原版一律以不透明輸出。"
@@ -2186,32 +2233,6 @@ with gr.Blocks(delete_cache=(600, 600), title="TRELLIS.2 圖片轉 3D") as demo:
                                  "透明裁切：透明度低於 50% 的部分直接挖空（適合鏤空網格、葉片），不需排序。",
                         )
                         expert_reset_btn = gr.Button("還原專家設定預設值", size="sm")
-
-                with gr.Column(scale=7):
-                    with gr.Walkthrough(selected=0) as walkthrough:
-                        with gr.Step("預覽", id=0):
-                            candidate_pick = gr.Radio(
-                                [], label="候選模型",
-                                info="「專家設定 → 一次生成幾個候選」大於 1 時，可在這裡切換要使用哪一個（會重設 GLB 編輯狀態）。",
-                            )
-                            view_mode = gr.Radio(
-                                [VIEW_STATIC, VIEW_LIVE], value=VIEW_STATIC, label="預覽方式",
-                                info="靜態渲染預覽：生成後立即可看，6 種渲染模式 × 8 個視角；"
-                                     "即時 3D 檢視：自動匯出 GLB（約 30 秒）後用 three.js 自由旋轉縮放，並可使用 GLB 編輯功能。",
-                            )
-                            preview_output = gr.HTML(empty_html, label="3D 素材預覽", show_label=True, container=True, elem_id="preview-static")
-                            live_view = gr.HTML(live_viewer_html, label="即時 3D 檢視（three.js）", show_label=True, container=True, elem_id="preview-live")
-                            with gr.Row():
-                                extract_btn = gr.Button("匯出 GLB")
-                                to_shrink_btn = gr.Button("送到 GLB 壓縮 ➜")
-                            gr.Markdown("*「匯出 GLB」：依目前的減面、貼圖、GLB 編輯與專家設定輸出可下載的 GLB；"
-                                        "「送到 GLB 壓縮」：把目前編輯好的模型帶到 GLB 壓縮分頁做 Draco + WebP 壓縮。*")
-                        with gr.Step("匯出", id=1):
-                            glb_output = gr.Model3D(label="已匯出的 GLB", height=724, show_label=True, display_mode="solid", clear_color=(0.25, 0.25, 0.25, 1.0))
-                            download_btn = gr.DownloadButton(label="下載 GLB")
-                            dims_md = gr.Markdown("")
-                            to_shrink_btn2 = gr.Button("送到 GLB 壓縮 ➜")
-                            gr.Markdown("*匯出 GLB 需要重新網格化、減面與材質烘焙，通常需要半分鐘以上，請耐心等候。*")
 
         with gr.Tab("GLB 壓縮", id="shrink"):
             # Mirrors github.com/lorenhsu1128/glb-shrink: hero strip, controls, before/after viewers
