@@ -1795,12 +1795,12 @@ def shrink_ingest(path: str, name: str, req: gr.Request):
     info = run_shrink("inspect", src_path)
     src = {'path': src_path, 'name': os.path.basename(name), 'size': info['fileSize'], 'tris': info['tris']}
     meta = f"**{src['name']}**　`{format_tris(src['tris'])} · {format_bytes(src['size'])}`"
-    return src, shrink_hero_html(src), shrink_view_json(src), meta, gr.update(value=None, visible=False)
+    return src, shrink_hero_html(src), shrink_view_json(src), meta, gr.update(value=None, interactive=False)
 
 
 def shrink_upload(file_path: Optional[str], req: gr.Request):
     if not file_path:
-        return None, shrink_hero_html(), shrink_view_json(None), "", gr.update(value=None, visible=False)
+        return None, shrink_hero_html(), shrink_view_json(None), "", gr.update(value=None, interactive=False)
     return shrink_ingest(file_path, os.path.basename(file_path), req)
 
 
@@ -1813,7 +1813,7 @@ def shrink_compress(src: Optional[dict], quality: float, req: gr.Request, progre
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     result = run_shrink("compress", src['path'], out_path, str(int(quality)))
     out = {'path': out_path, 'size': result['outputSize'], 'tris': result['stats']['finalTris']}
-    return shrink_hero_html(src, out), shrink_view_json(src, out), gr.update(value=out_path, visible=True)
+    return shrink_hero_html(src, out), shrink_view_json(src, out), gr.update(value=out_path, interactive=True)
 
 
 def send_to_shrink(
@@ -1956,7 +1956,8 @@ with gr.Blocks(delete_cache=(600, 600), title="TRELLIS.2 圖片轉 3D") as demo:
                     shrink_quality = gr.Slider(0, 100, value=50, step=1, label="檔案更小 ↔ 外觀更清晰")
                     shrink_hint_md = gr.Markdown(shrink_hint(50))
                     shrink_btn = gr.Button("壓縮模型", variant="primary")
-                    shrink_download = gr.DownloadButton("下載壓縮後的 GLB", visible=False)
+                    # Always rendered: a DownloadButton that starts hidden loses its file value when shown (Gradio 6)
+                    shrink_download = gr.DownloadButton("下載壓縮後的 GLB", interactive=False)
                     gr.Markdown(
                         "*流程：移除舊壓縮擴充 → 合併頂點 → meshoptimizer 減面 → 重算平滑法線 → "
                         "貼圖轉 WebP 並縮小 → Draco 幾何壓縮。輸出使用 `KHR_draco_mesh_compression` 與 "
