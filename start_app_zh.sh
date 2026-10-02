@@ -20,6 +20,19 @@ echo " 本機：      http://localhost:${APP_PORT}"
 for ip in $(hostname -I); do
   case "$ip" in 127.*|172.*|169.254.*) ;; *) echo " 區域網路：  http://${ip}:${APP_PORT}" ;; esac
 done
-echo " 關閉服務：  在此視窗按 Ctrl+C"
+echo " 關閉服務：  在此視窗按 Ctrl+C（直接關閉視窗也會停止服務）"
 echo "============================================================"
-exec python app_zh.py
+# Server output goes to a log file and this window only tails it: selecting text in a Windows
+# console (QuickEdit) pauses its output, which would otherwise block the server mid-request.
+LOG_DIR="$HOME/.cache/trellis2_app_zh"
+LOG="$LOG_DIR/server.log"
+mkdir -p "$LOG_DIR"
+[ -f "$LOG" ] && mv -f "$LOG" "$LOG.prev"
+echo " 伺服器紀錄： $LOG"
+python app_zh.py > "$LOG" 2>&1 &
+SERVER_PID=$!
+trap 'kill $SERVER_PID 2>/dev/null; wait $SERVER_PID 2>/dev/null' INT TERM EXIT
+tail -n +1 -F --pid="$SERVER_PID" "$LOG" 2>/dev/null
+rc=0
+wait "$SERVER_PID" || rc=$?
+echo "伺服器已停止（結束代碼 $rc），詳細紀錄見 $LOG"

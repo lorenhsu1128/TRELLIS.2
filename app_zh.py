@@ -13,6 +13,7 @@ from PIL import Image
 import base64
 import io
 import uuid
+import time
 import json
 import subprocess
 import re
@@ -73,6 +74,13 @@ ORIGIN_MODES = [ORIGIN_CENTER, ORIGIN_BOTTOM, ORIGIN_TOP, ORIGIN_CUSTOM]
 # Bounded LRU; an entry is also dropped on a new generation and when the session ends.
 RAW_GLB = OrderedDict()
 RAW_GLB_MAX_SESSIONS = 2
+# Generated candidates per session: [{'state', 'html', 'seed'}, ...] (num_samples > 1)
+CANDIDATES = {}
+ALPHA_MODES = {
+    "不透明（OPAQUE）": "OPAQUE",
+    "半透明混合（BLEND）": "BLEND",
+    "透明裁切（MASK）": "MASK",
+}
 # Keeping every model resident on a 32GB GPU leaves too little room for 1024+ generation,
 # so models are swapped CPU<->GPU per request (low_vram). The launcher pins glibc's mmap
 # threshold so freed weight copies go back to the OS instead of fragmenting the heap.
@@ -1150,6 +1158,7 @@ def end_session(req: gr.Request):
     user_dir = os.path.join(TMP_DIR, str(req.session_hash))
     shutil.rmtree(user_dir, ignore_errors=True)
     RAW_GLB.pop(str(req.session_hash), None)
+    CANDIDATES.pop(str(req.session_hash), None)
     release_memory()
 
 
@@ -1210,48 +1219,94 @@ def image_to_3d(
     tex_slat_guidance_rescale: float,
     tex_slat_sampling_steps: int,
     tex_slat_rescale_t: float,
+    num_candidates: int,
+    ss_interval_start: float,
+    ss_interval_end: float,
+    shape_interval_start: float,
+    shape_interval_end: float,
+    tex_interval_start: float,
+    tex_interval_end: float,
     req: gr.Request,
     progress=gr.Progress(track_tqdm=True),
-) -> str:
-    # --- Sampling ---
-    outputs, latents = pipeline.run(
-        image,
-        seed=seed,
-        preprocess_image=False,
+):
+    """
+    Generate one or more candidates (seed, seed+1, ...) and show the first one.
+    Candidates are kept server-side so switching between them needs no re-generation.
+    """
+    if image is None:
+        raise gr.Error("請先上傳圖片。")
+
+    def interval(a, b):
+        a, b = float(a), float(b)
+        if a >= b:
+            raise gr.Error(f"引導區間的起點（{a}）必須小於終點（{b}）。")
+        return [a, b]
+
+    params = dict(
         sparse_structure_sampler_params={
             "steps": ss_sampling_steps,
             "guidance_strength": ss_guidance_strength,
             "guidance_rescale": ss_guidance_rescale,
             "rescale_t": ss_rescale_t,
+            "guidance_interval": interval(ss_interval_start, ss_interval_end),
         },
         shape_slat_sampler_params={
             "steps": shape_slat_sampling_steps,
             "guidance_strength": shape_slat_guidance_strength,
             "guidance_rescale": shape_slat_guidance_rescale,
             "rescale_t": shape_slat_rescale_t,
+            "guidance_interval": interval(shape_interval_start, shape_interval_end),
         },
         tex_slat_sampler_params={
             "steps": tex_slat_sampling_steps,
             "guidance_strength": tex_slat_guidance_strength,
             "guidance_rescale": tex_slat_guidance_rescale,
             "rescale_t": tex_slat_rescale_t,
+            "guidance_interval": interval(tex_interval_start, tex_interval_end),
         },
         pipeline_type={
             "512": "512",
             "1024": "1024_cascade",
             "1536": "1536_cascade",
         }[resolution],
-        return_latent=True,
     )
-    mesh = outputs[0]
-    mesh.simplify(16777216) # nvdiffrast limit
-    images = render_utils.render_snapshot(mesh, resolution=1024, r=2, fov=36, nviews=STEPS, envmap=envmap)
-    state = pack_state(latents)
-    # The previous generation's raw GLB mesh is now stale
-    RAW_GLB.pop(str(req.session_hash), None)
-    del outputs, latents, mesh
+    session = str(req.session_hash)
+    # The previous generation's raw GLB mesh and candidates are now stale
+    RAW_GLB.pop(session, None)
+    CANDIDATES.pop(session, None)
     release_memory()
-    
+
+    candidates = []
+    for i in range(int(num_candidates)):
+        outputs, latents = pipeline.run(image, seed=int(seed) + i, preprocess_image=False, return_latent=True, **params)
+        mesh = outputs[0]
+        mesh.simplify(16777216)  # nvdiffrast limit
+        images = render_utils.render_snapshot(mesh, resolution=1024, r=2, fov=36, nviews=STEPS, envmap=envmap)
+        candidates.append({'state': pack_state(latents), 'html': build_preview_html(images), 'seed': int(seed) + i})
+        del outputs, latents, mesh, images
+        release_memory()
+    CANDIDATES[session] = candidates
+
+    labels = candidate_labels(candidates)
+    return candidates[0]['state'], candidates[0]['html'], gr.update(choices=labels, value=labels[0])
+
+
+def candidate_labels(candidates: List[dict]) -> List[str]:
+    return [f"候選 {i + 1}（種子 {c['seed']}）" for i, c in enumerate(candidates)]
+
+
+def select_candidate(label: str, req: gr.Request):
+    """Switch the active candidate; resets the export/edit state like a new generation."""
+    candidates = CANDIDATES.get(str(req.session_hash))
+    if not candidates or not label:
+        return (gr.skip(),) * 2
+    labels = candidate_labels(candidates)
+    c = candidates[labels.index(label)] if label in labels else candidates[0]
+    RAW_GLB.pop(str(req.session_hash), None)
+    return c['state'], c['html']
+
+
+def build_preview_html(images: dict) -> str:
     # --- HTML Construction ---
     # The Stack of 48 Images
     images_html = ""
@@ -1315,7 +1370,7 @@ def image_to_3d(
     </div>
     """
     
-    return state, full_html
+    return full_html
 
 
 def extract_glb(
@@ -1333,6 +1388,12 @@ def extract_glb(
     origin_dx: float,
     origin_dy: float,
     origin_dz: float,
+    exp_remesh_project: float,
+    exp_cone_deg: float,
+    exp_refine_iters: int,
+    exp_global_iters: int,
+    exp_smooth: float,
+    exp_alpha_mode: str,
     glb_cache: Optional[dict],
     req: gr.Request,
     progress=gr.Progress(track_tqdm=True),
@@ -1357,7 +1418,9 @@ def extract_glb(
         raise gr.Error("請先按「生成」建立 3D 素材。")
     edit = make_edit(scale_mode, target_cm, rot_x, rot_y, rot_z, keep_parts, origin_mode, origin_point,
                      origin_dx, origin_dy, origin_dz)
-    glb_cache = get_or_export_glb(state, decimation_target, texture_size, edit, glb_cache, req)
+    glb_cache = get_or_export_glb(state, decimation_target, texture_size, edit, glb_cache, req,
+                                  make_export_opts(exp_remesh_project, exp_cone_deg, exp_refine_iters,
+                                                   exp_global_iters, exp_smooth, exp_alpha_mode))
     path = glb_cache['path']
     return path, path, glb_cache, format_dims(glb_cache['dims']), parts_update(glb_cache)
 
@@ -1378,6 +1441,12 @@ def prepare_live_glb(
     origin_dx: float,
     origin_dy: float,
     origin_dz: float,
+    exp_remesh_project: float,
+    exp_cone_deg: float,
+    exp_refine_iters: int,
+    exp_global_iters: int,
+    exp_smooth: float,
+    exp_alpha_mode: str,
     glb_cache: Optional[dict],
     req: gr.Request,
     progress=gr.Progress(track_tqdm=True),
@@ -1392,7 +1461,9 @@ def prepare_live_glb(
         return gr.skip(), "", gr.skip(), gr.skip(), gr.skip(), gr.skip()
     edit = make_edit(scale_mode, target_cm, rot_x, rot_y, rot_z, keep_parts, origin_mode, origin_point,
                      origin_dx, origin_dy, origin_dz)
-    glb_cache = get_or_export_glb(state, decimation_target, texture_size, edit, glb_cache, req)
+    glb_cache = get_or_export_glb(state, decimation_target, texture_size, edit, glb_cache, req,
+                                  make_export_opts(exp_remesh_project, exp_cone_deg, exp_refine_iters,
+                                                   exp_global_iters, exp_smooth, exp_alpha_mode))
     path = glb_cache['path']
     return glb_cache, f"/gradio_api/file={path}", path, path, format_dims(glb_cache['dims']), parts_update(glb_cache)
 
@@ -1413,6 +1484,12 @@ def refresh_transformed_glb(
     origin_dx: float,
     origin_dy: float,
     origin_dz: float,
+    exp_remesh_project: float,
+    exp_cone_deg: float,
+    exp_refine_iters: int,
+    exp_global_iters: int,
+    exp_smooth: float,
+    exp_alpha_mode: str,
     glb_cache: Optional[dict],
     req: gr.Request,
 ):
@@ -1428,7 +1505,9 @@ def refresh_transformed_glb(
         gr.Info("請在「即時 3D 檢視」按「設定原點」，再點選模型表面。目前暫用幾何中心。")
     edit = make_edit(scale_mode, target_cm, rot_x, rot_y, rot_z, keep_parts, origin_mode, origin_point,
                      origin_dx, origin_dy, origin_dz)
-    glb_cache = get_or_export_glb(state, decimation_target, texture_size, edit, glb_cache, req)
+    glb_cache = get_or_export_glb(state, decimation_target, texture_size, edit, glb_cache, req,
+                                  make_export_opts(exp_remesh_project, exp_cone_deg, exp_refine_iters,
+                                                   exp_global_iters, exp_smooth, exp_alpha_mode))
     path = glb_cache['path']
     url = f"/gradio_api/file={path}" if mode == VIEW_LIVE else gr.skip()
     return glb_cache, url, path, path, format_dims(glb_cache['dims']), parts_update(glb_cache)
@@ -1451,6 +1530,12 @@ def set_origin_from_pick(
     origin_dx: float,
     origin_dy: float,
     origin_dz: float,
+    exp_remesh_project: float,
+    exp_cone_deg: float,
+    exp_refine_iters: int,
+    exp_global_iters: int,
+    exp_smooth: float,
+    exp_alpha_mode: str,
     glb_cache: Optional[dict],
     req: gr.Request,
 ):
@@ -1466,7 +1551,9 @@ def set_origin_from_pick(
         return (gr.skip(),) * 11
     raw_point = trimesh.transform_points(point[None], np.linalg.inv(np.array(glb_cache['matrix'])))[0].tolist()
     edit = make_edit(scale_mode, target_cm, rot_x, rot_y, rot_z, keep_parts, ORIGIN_CUSTOM, raw_point, 0, 0, 0)
-    glb_cache = get_or_export_glb(state, decimation_target, texture_size, edit, glb_cache, req)
+    glb_cache = get_or_export_glb(state, decimation_target, texture_size, edit, glb_cache, req,
+                                  make_export_opts(exp_remesh_project, exp_cone_deg, exp_refine_iters,
+                                                   exp_global_iters, exp_smooth, exp_alpha_mode))
     path = glb_cache['path']
     url = f"/gradio_api/file={path}" if mode == VIEW_LIVE else gr.skip()
     return (glb_cache, url, path, path, format_dims(glb_cache['dims']), parts_update(glb_cache),
@@ -1621,21 +1708,27 @@ def get_or_export_glb(
     edit: dict,
     glb_cache: Optional[dict],
     req: gr.Request,
+    export_opts: Optional[dict] = None,
 ) -> dict:
     """
     Reuse the GLB exported for the current generation when the export settings are unchanged.
     The raw remeshed + baked mesh (and its part split) is kept per session, so editing
     parts / size / rotation / origin only re-exports (~1-3 s).
     """
-    key = [state['gen_id'], int(decimation_target), int(texture_size), edit]
+    export_opts = export_opts or make_export_opts()
+    raw_opts = {k: v for k, v in export_opts.items() if k != 'alpha_mode'}  # need a new remesh/bake
+    key = [state['gen_id'], int(decimation_target), int(texture_size), raw_opts, edit, export_opts['alpha_mode']]
     if glb_cache and glb_cache['key'] == key and os.path.exists(glb_cache['path']):
         return glb_cache
+    t_start = time.time()
     session = str(req.session_hash)
-    raw_key = key[:3]
+    raw_key = key[:4]
     raw = RAW_GLB.get(session)
     if raw is None or raw['key'] != raw_key:
         RAW_GLB.pop(session, None)
-        mesh = build_raw_glb(state, decimation_target, texture_size)
+        print(f"[export] {datetime.now():%T} remesh+bake start opts={raw_opts}", flush=True)
+        mesh = build_raw_glb(state, decimation_target, texture_size, raw_opts)
+        print(f"[export] {datetime.now():%T} remesh+bake done {time.time() - t_start:.1f}s", flush=True)
         face_group, fracs = split_parts(mesh)
         labels = [f"部件 {i + 1}（{f * 100:.0f}%）" for i, f in enumerate(fracs)]
         raw = {'key': raw_key, 'mesh': mesh, 'face_group': face_group, 'labels': labels}
@@ -1654,12 +1747,38 @@ def get_or_export_glb(
     scene = trimesh.Scene()
     for i, part in parts.items():
         part.apply_transform(T)
+        apply_alpha_mode(part, export_opts['alpha_mode'])
         scene.add_geometry(part, node_name=f"part_{i + 1}", geom_name=f"part_{i + 1}")
     glb_path = save_glb(scene, req)
     dims = scene.extents.tolist()
     del parts, scene
     release_memory()
+    print(f"[export] {datetime.now():%T} glb written {time.time() - t_start:.1f}s edit={edit} alpha={export_opts['alpha_mode']}", flush=True)
     return {'key': key, 'path': glb_path, 'dims': dims, 'matrix': T.tolist(), 'labels': labels, 'kept': keep}
+
+
+def make_export_opts(remesh_project=0.0, cone_deg=90.0, refine_iters=0, global_iters=1, smooth=1.0,
+                     alpha_mode="不透明（OPAQUE）") -> dict:
+    """Expert GLB export options (defaults = the original app.py behavior)."""
+    return {
+        'remesh_project': round(float(remesh_project), 3),
+        'cone_deg': round(float(cone_deg), 2),
+        'refine_iters': int(refine_iters),
+        'global_iters': max(1, int(global_iters)),
+        'smooth': round(float(smooth), 3),
+        'alpha_mode': ALPHA_MODES.get(alpha_mode, alpha_mode if alpha_mode in ALPHA_MODES.values() else 'OPAQUE'),
+    }
+
+
+def apply_alpha_mode(mesh: trimesh.Trimesh, alpha_mode: str):
+    """to_glb always writes OPAQUE although the alpha channel is baked; expose it."""
+    material = getattr(mesh.visual, 'material', None)
+    if material is None:
+        return
+    # The raw mesh's material is shared across exports, so set every field explicitly
+    material.alphaMode = alpha_mode
+    material.alphaCutoff = 0.5 if alpha_mode == 'MASK' else None
+    material.doubleSided = alpha_mode == 'BLEND'  # remeshed output is single-sided otherwise
 
 
 def save_glb(mesh: Union[trimesh.Trimesh, trimesh.Scene], req: gr.Request) -> str:
@@ -1676,7 +1795,9 @@ def build_raw_glb(
     state: dict,
     decimation_target: int,
     texture_size: int,
+    opts: Optional[dict] = None,
 ) -> trimesh.Trimesh:
+    opts = opts or {k: v for k, v in make_export_opts().items() if k != 'alpha_mode'}
     shape_slat, tex_slat, res = unpack_state(state)
     mesh = pipeline.decode_latent(shape_slat, tex_slat, res)[0]
     glb = o_voxel.postprocess.to_glb(
@@ -1691,7 +1812,11 @@ def build_raw_glb(
         texture_size=texture_size,
         remesh=True,
         remesh_band=1,
-        remesh_project=0,
+        remesh_project=opts['remesh_project'],
+        mesh_cluster_threshold_cone_half_angle_rad=np.radians(opts['cone_deg']),
+        mesh_cluster_refine_iterations=opts['refine_iters'],
+        mesh_cluster_global_iterations=opts['global_iters'],
+        mesh_cluster_smooth_strength=opts['smooth'],
         use_tqdm=True,
     )
     torch.cuda.empty_cache()
@@ -1831,6 +1956,12 @@ def send_to_shrink(
     origin_dx: float,
     origin_dy: float,
     origin_dz: float,
+    exp_remesh_project: float,
+    exp_cone_deg: float,
+    exp_refine_iters: int,
+    exp_global_iters: int,
+    exp_smooth: float,
+    exp_alpha_mode: str,
     glb_cache: Optional[dict],
     req: gr.Request,
     progress=gr.Progress(track_tqdm=True),
@@ -1840,7 +1971,9 @@ def send_to_shrink(
         raise gr.Error("請先按「生成」建立 3D 素材。")
     edit = make_edit(scale_mode, target_cm, rot_x, rot_y, rot_z, keep_parts, origin_mode, origin_point,
                      origin_dx, origin_dy, origin_dz)
-    glb_cache = get_or_export_glb(state, decimation_target, texture_size, edit, glb_cache, req)
+    glb_cache = get_or_export_glb(state, decimation_target, texture_size, edit, glb_cache, req,
+                                  make_export_opts(exp_remesh_project, exp_cone_deg, exp_refine_iters,
+                                                   exp_global_iters, exp_smooth, exp_alpha_mode))
     name = f"trellis_{datetime.now():%Y%m%d_%H%M%S}.glb"
     # Clear the upload widget so it does not show a previously uploaded file
     return (glb_cache, gr.Tabs(selected="shrink"), None, *shrink_ingest(glb_cache['path'], name, req))
@@ -1857,91 +1990,228 @@ with gr.Blocks(delete_cache=(600, 600), title="TRELLIS.2 圖片轉 3D") as demo:
     with gr.Tabs(selected="gen") as tabs:
         with gr.Tab("圖片轉 3D", id="gen"):
             with gr.Row():
-                with gr.Column(scale=1, min_width=360):
+                with gr.Column(scale=4, min_width=400):  # wider: parameters carry long explanations
                     image_prompt = gr.Image(label="輸入圖片", format="png", image_mode="RGBA", type="pil", sources=["upload", "clipboard"], height=400)
+                    gr.Markdown(
+                        "*上傳後會自動去背並裁切到物件範圍。若圖片已有透明背景（PNG 帶 alpha），會直接使用不再去背。"
+                        "**請上傳單一視角**：正面或 3/4 角度效果最好；三視圖整張上傳會被生成成三個物件。*"
+                    )
 
-                    resolution = gr.Radio(["512", "1024", "1536"], label="解析度", value="1024",
-                                          info="1536 生成約 2 分鐘、匯出 GLB 約 5 分鐘（會用滿 32GB 顯存）；1024 約 45 秒 + 30 秒")
-                    seed = gr.Slider(0, MAX_SEED, label="隨機種子", value=0, step=1)
-                    randomize_seed = gr.Checkbox(label="每次隨機產生種子", value=True)
-                    decimation_target = gr.Slider(100000, 1000000, label="減面目標（面數）", value=500000, step=10000)
-                    texture_size = gr.Slider(1024, 4096, label="貼圖尺寸", value=2048, step=1024)
+                    resolution = gr.Radio(
+                        ["512", "1024", "1536"], label="解析度", value="1024",
+                        info="生成的體素解析度，決定幾何與材質的細緻程度。"
+                             "512：最快（約 15 秒），細節較少，適合快速試圖；"
+                             "1024：建議值（生成約 45 秒、匯出約 30 秒），細節與速度平衡；"
+                             "1536：細節最多，但生成約 2 分鐘、匯出 GLB 約 5 分鐘且會用滿 32GB 顯存。",
+                    )
+                    seed = gr.Slider(
+                        0, MAX_SEED, label="隨機種子", value=0, step=1,
+                        info="決定生成時的隨機雜訊。相同圖片 + 相同種子 + 相同參數會得到相同結果；"
+                             "換種子會得到不同的形狀與細節變化。找到滿意的結果時記下種子，之後可重現。",
+                    )
+                    randomize_seed = gr.Checkbox(
+                        label="每次隨機產生種子", value=True,
+                        info="勾選：每次按「生成」都換一個新種子（探索不同結果）；"
+                             "取消勾選：使用上方固定的種子（重現或微調參數比較差異）。",
+                    )
+                    decimation_target = gr.Slider(
+                        100000, 1000000, label="減面目標（面數）", value=500000, step=10000,
+                        info="匯出 GLB 時重新網格化後要保留的三角面數上限。"
+                             "越高：細節越多、檔案越大、遊戲中渲染越吃效能；越低：越輕量但小細節會被抹平。"
+                             "遊戲用建議 10～30 萬，展示用 50～100 萬。也是 GLB 壓縮能降到多少面數的主要因素。",
+                    )
+                    texture_size = gr.Slider(
+                        1024, 4096, label="貼圖尺寸", value=2048, step=1024,
+                        info="烘焙出的 PBR 貼圖（基礎色、金屬度、粗糙度）邊長像素。"
+                             "越大：表面花紋與文字越清晰，但檔案與顯存用量約隨邊長平方成長；"
+                             "1024 適合遠景或小物件、2048 為一般建議、4096 適合主角近拍。",
+                    )
 
                     with gr.Accordion(label="GLB 編輯（部件、尺寸、方向、原點）", open=True):
                         gr.Markdown("匯出 GLB（或切換到即時 3D 檢視）後即可編輯，每次調整約 1–3 秒自動重新匯出。"
-                                    "**建議上傳單一視角的圖片**：整張三視圖會被當成三個物件生成，每個只分到約 1/3 的解析度。")
-                        keep_parts = gr.CheckboxGroup([], label="保留的部件",
-                                                      info="空間上分開的物件會自動分成部件（編號標示在即時 3D 檢視中），取消勾選即刪除")
+                                    "*套用順序：保留部件 → 旋轉 → 等比例縮放 → 移動原點。*")
+                        keep_parts = gr.CheckboxGroup(
+                            [], label="保留的部件",
+                            info="匯出時會自動把空間上分開的物件分成「部件 1、2、3…」（依大小排序，括號內為面數占比），"
+                                 "編號會以黃色數字標示在即時 3D 檢視中。取消勾選即從 GLB 刪除該部件，"
+                                 "例如三視圖生成的三個模型只保留一個。至少需保留一個。",
+                        )
                         with gr.Row():
-                            scale_mode = gr.Dropdown(SCALE_MODES, value=SCALE_NONE, label="縮放依據", min_width=160)
-                            target_cm = gr.Number(value=100, minimum=0.1, label="目標長度（cm）", min_width=120)
+                            scale_mode = gr.Dropdown(
+                                SCALE_MODES, value=SCALE_NONE, label="縮放依據", min_width=160,
+                                info="TRELLIS 會把每個模型正規化成最長邊約 100 cm，不同部件比例不一致。"
+                                     "選擇以哪一軸為基準，等比例縮放成右側指定的實際長度（旋轉後的軸向）。",
+                            )
+                            target_cm = gr.Number(
+                                value=100, minimum=0.1, label="目標長度（cm）", min_width=120,
+                                info="縮放依據那一軸要變成的實際長度。GLB 單位為公尺，three.js 中 1 單位 = 1 m。"
+                                     "按 Enter 或點到其他地方套用。",
+                            )
                         with gr.Row():
-                            rot_x = gr.Number(value=0, step=1, label="繞 X 軸旋轉（°）", min_width=100)
-                            rot_y = gr.Number(value=0, step=1, label="繞 Y 軸旋轉（°）", min_width=100)
-                            rot_z = gr.Number(value=0, step=1, label="繞 Z 軸旋轉（°）", min_width=100)
-                        gr.Markdown("*旋轉可輸入任意角度（可含小數、負數），按 Enter 或點到其他地方即套用；依右手定則，正值為逆時針。*")
-                        origin_mode = gr.Dropdown(ORIGIN_MODES, value=ORIGIN_CENTER, label="原點位置",
-                                                  info="自訂：在即時 3D 檢視按「設定原點」再點選模型表面（例如關節處）")
+                            rot_x = gr.Number(value=0, step=1, label="繞 X 軸旋轉（°）", min_width=100,
+                                              info="繞紅色 X 軸旋轉，常用於把向前/向後倒的模型扶正。")
+                            rot_y = gr.Number(value=0, step=1, label="繞 Y 軸旋轉（°）", min_width=100,
+                                              info="繞綠色 Y 軸（朝上）旋轉，用來調整模型面向的方向。")
+                            rot_z = gr.Number(value=0, step=1, label="繞 Z 軸旋轉（°）", min_width=100,
+                                              info="繞藍色 Z 軸旋轉，常用於把側躺的模型扶正。")
+                        gr.Markdown("*旋轉可輸入任意角度（可含小數、負數），固定依 X → Y → Z 順序套用；"
+                                    "依右手定則，從軸的正方向看過去正值為逆時針。按 Enter 或點到其他地方即套用。*")
+                        origin_mode = gr.Dropdown(
+                            ORIGIN_MODES, value=ORIGIN_CENTER, label="原點位置",
+                            info="GLB 的 (0,0,0) 放在哪裡，決定在 three.js 中 position 的基準點與旋轉的支點。"
+                                 "幾何中心：外框正中央；底部中心：腳底，適合站在地面的物件；"
+                                 "頂部中心：適合吊掛的部件（如手臂從肩膀往下）；"
+                                 "自訂：在即時 3D 檢視按「設定原點」再點選模型表面（例如關節處）。",
+                        )
                         with gr.Row():
-                            origin_dx = gr.Number(value=0, step=0.1, label="原點微調 X（cm）", min_width=100)
-                            origin_dy = gr.Number(value=0, step=0.1, label="原點微調 Y（cm）", min_width=100)
-                            origin_dz = gr.Number(value=0, step=0.1, label="原點微調 Z（cm）", min_width=100)
+                            origin_dx = gr.Number(value=0, step=0.1, label="原點微調 X（cm）", min_width=100,
+                                                  info="原點沿 X 軸再移動的距離，正值往紅色箭頭方向。")
+                            origin_dy = gr.Number(value=0, step=0.1, label="原點微調 Y（cm）", min_width=100,
+                                                  info="原點沿 Y 軸再移動的距離，正值往上。")
+                            origin_dz = gr.Number(value=0, step=0.1, label="原點微調 Z（cm）", min_width=100,
+                                                  info="原點沿 Z 軸再移動的距離，正值往藍色箭頭方向。")
                         with gr.Row():
-                            gr.Markdown("*微調：在上方位置的基礎上，沿最終的 X/Y/Z 軸移動原點（例如 Y = 2.5 表示原點往上 2.5 cm）；點選模型設定原點時會自動歸零。*")
+                            gr.Markdown("*微調是在上方原點位置的基礎上，沿最終（旋轉、縮放後）的軸向移動；"
+                                        "點選模型設定原點時會自動歸零。即時 3D 檢視左上角會顯示模型相對原點的範圍。*")
                             origin_offset_reset = gr.Button("微調歸零", size="sm", scale=0, min_width=90)
-                        gr.Markdown("*套用順序：保留部件 → 旋轉 → 等比例縮放 → 移動原點。*")
 
                     generate_btn = gr.Button("生成", variant="primary")
 
-                    with gr.Accordion(label="進階設定", open=False):
-                        gr.Markdown("階段 1：稀疏結構生成")
+                    with gr.Accordion(label="進階設定（三階段取樣參數）", open=False):
+                        gr.Markdown(
+                            "TRELLIS.2 分三個階段生成，每個階段都用 flow matching 從雜訊逐步去噪：\n"
+                            "1. **稀疏結構**：決定哪些體素被佔據，也就是整體輪廓與大致形狀。\n"
+                            "2. **形狀**：在這些體素上生成精細幾何（表面細節、邊角）。\n"
+                            "3. **材質**：依形狀生成 PBR 材質（顏色、金屬度、粗糙度）。\n\n"
+                            "四個參數的意義：**引導強度**（CFG）越高越貼近輸入圖片，過高會過度銳化、破面或顏色過飽和，1 = 不使用引導；"
+                            "**引導重新縮放**用來抑制高引導強度造成的過度飽和與爆亮，0 = 不抑制、1 = 完全抑制；"
+                            "**取樣步數**越多越穩定、細節越完整，但時間大致與步數成正比；"
+                            "**時間重新縮放**越大越把步數集中在高雜訊（決定大結構）的階段，通常讓整體結構更穩，"
+                            "過大可能損失細節。預設值為官方建議值。"
+                        )
+                        gr.Markdown("**階段 1：稀疏結構生成**（影響輪廓與整體形狀）")
                         with gr.Row():
-                            ss_guidance_strength = gr.Slider(1.0, 10.0, label="引導強度", value=7.5, step=0.1)
-                            ss_guidance_rescale = gr.Slider(0.0, 1.0, label="引導重新縮放", value=0.7, step=0.01)
-                            ss_sampling_steps = gr.Slider(1, 50, label="取樣步數", value=12, step=1)
-                            ss_rescale_t = gr.Slider(1.0, 6.0, label="時間重新縮放（Rescale T）", value=5.0, step=0.1)
-                        gr.Markdown("階段 2：形狀生成")
+                            ss_guidance_strength = gr.Slider(1.0, 10.0, label="引導強度", value=7.5, step=0.1,
+                                                             info="預設 7.5。調高：輪廓更貼近圖片；調低：形狀更自由但可能偏離圖片。")
+                            ss_guidance_rescale = gr.Slider(0.0, 1.0, label="引導重新縮放", value=0.7, step=0.01,
+                                                            info="預設 0.7。出現多餘碎塊或過度膨脹時可調高。")
                         with gr.Row():
-                            shape_slat_guidance_strength = gr.Slider(1.0, 10.0, label="引導強度", value=7.5, step=0.1)
-                            shape_slat_guidance_rescale = gr.Slider(0.0, 1.0, label="引導重新縮放", value=0.5, step=0.01)
-                            shape_slat_sampling_steps = gr.Slider(1, 50, label="取樣步數", value=12, step=1)
-                            shape_slat_rescale_t = gr.Slider(1.0, 6.0, label="時間重新縮放（Rescale T）", value=3.0, step=0.1)
-                        gr.Markdown("階段 3：材質生成")
+                            ss_sampling_steps = gr.Slider(1, 50, label="取樣步數", value=12, step=1,
+                                                          info="預設 12。輪廓不穩或有缺塊時可增加到 20～30。")
+                            ss_rescale_t = gr.Slider(1.0, 6.0, label="時間重新縮放（Rescale T）", value=5.0, step=0.1,
+                                                     info="預設 5.0。此階段以大結構為主，建議維持較高值。")
+                        gr.Markdown("**階段 2：形狀生成**（影響幾何細節）")
                         with gr.Row():
-                            tex_slat_guidance_strength = gr.Slider(1.0, 10.0, label="引導強度", value=1.0, step=0.1)
-                            tex_slat_guidance_rescale = gr.Slider(0.0, 1.0, label="引導重新縮放", value=0.0, step=0.01)
-                            tex_slat_sampling_steps = gr.Slider(1, 50, label="取樣步數", value=12, step=1)
-                            tex_slat_rescale_t = gr.Slider(1.0, 6.0, label="時間重新縮放（Rescale T）", value=3.0, step=0.1)
+                            shape_slat_guidance_strength = gr.Slider(1.0, 10.0, label="引導強度", value=7.5, step=0.1,
+                                                                     info="預設 7.5。調高：表面細節更貼近圖片；過高會出現尖刺或破面。")
+                            shape_slat_guidance_rescale = gr.Slider(0.0, 1.0, label="引導重新縮放", value=0.5, step=0.01,
+                                                                    info="預設 0.5。表面出現雜訊或過度銳化時可調高。")
+                        with gr.Row():
+                            shape_slat_sampling_steps = gr.Slider(1, 50, label="取樣步數", value=12, step=1,
+                                                                  info="預設 12。增加可讓細節更完整，生成時間隨之增加。")
+                            shape_slat_rescale_t = gr.Slider(1.0, 6.0, label="時間重新縮放（Rescale T）", value=3.0, step=0.1,
+                                                             info="預設 3.0。調低會保留更多細部，調高結構更穩。")
+                        gr.Markdown("**階段 3：材質生成**（影響顏色與金屬/粗糙質感）")
+                        with gr.Row():
+                            tex_slat_guidance_strength = gr.Slider(1.0, 10.0, label="引導強度", value=1.0, step=0.1,
+                                                                   info="預設 1.0（不使用引導）。調高可讓顏色更接近圖片，過高易過飽和。")
+                            tex_slat_guidance_rescale = gr.Slider(0.0, 1.0, label="引導重新縮放", value=0.0, step=0.01,
+                                                                  info="預設 0。調高引導強度後若顏色過飽和，再調高此值。")
+                        with gr.Row():
+                            tex_slat_sampling_steps = gr.Slider(1, 50, label="取樣步數", value=12, step=1,
+                                                                info="預設 12。材質出現斑駁或雜訊時可增加。")
+                            tex_slat_rescale_t = gr.Slider(1.0, 6.0, label="時間重新縮放（Rescale T）", value=3.0, step=0.1,
+                                                           info="預設 3.0。一般不需調整。")
 
-                with gr.Column(scale=10):
+                    with gr.Accordion(label="專家設定", open=False):
+                        gr.Markdown("#### 生成時生效（下次按「生成」才會套用）")
+                        num_candidates = gr.Slider(
+                            1, 4, value=1, step=1, label="一次生成幾個候選",
+                            info="以種子、種子+1、種子+2…各生成一個模型，生成後可在預覽上方切換挑選最好的。"
+                                 "時間約與數量成正比（1024 每個約 45 秒），候選只保留到下次生成。",
+                        )
+                        gr.Markdown(
+                            "**引導區間**：只在去噪過程的這段時間內套用「引導強度」（0 = 去噪結束、1 = 純雜訊開始）。"
+                            "區間越大，越多步驟受圖片引導，結果越貼近圖片但也越容易過度銳化；"
+                            "起點調低會讓引導延伸到細節階段，終點調低則讓開頭的大結構更自由。起點必須小於終點。"
+                        )
+                        with gr.Row():
+                            ss_interval_start = gr.Slider(0.0, 1.0, value=0.6, step=0.05, label="階段 1 區間起點",
+                                                          info="預設 0.6")
+                            ss_interval_end = gr.Slider(0.0, 1.0, value=1.0, step=0.05, label="階段 1 區間終點",
+                                                        info="預設 1.0")
+                        with gr.Row():
+                            shape_interval_start = gr.Slider(0.0, 1.0, value=0.6, step=0.05, label="階段 2 區間起點",
+                                                             info="預設 0.6")
+                            shape_interval_end = gr.Slider(0.0, 1.0, value=1.0, step=0.05, label="階段 2 區間終點",
+                                                           info="預設 1.0")
+                        with gr.Row():
+                            tex_interval_start = gr.Slider(0.0, 1.0, value=0.6, step=0.05, label="階段 3 區間起點",
+                                                           info="預設 0.6（材質引導強度為 1 時此設定無作用）")
+                            tex_interval_end = gr.Slider(0.0, 1.0, value=0.9, step=0.05, label="階段 3 區間終點",
+                                                         info="預設 0.9")
+
+                        gr.Markdown("#### 匯出 GLB 時生效（變更後若已匯出，會自動重新匯出，約 30～45 秒）")
+                        exp_remesh_project = gr.Slider(
+                            0.0, 1.0, value=0.0, step=0.05, label="頂點吸附原表面（remesh_project）",
+                            info="重新網格化後，把頂點往原始高解析表面拉回的程度。0：維持重建後較圓滑的表面（預設）；"
+                                 "越接近 1：稜角、刻線越銳利，適合機甲、武器等硬邊造型，但可能出現細小鋸齒。建議硬邊模型試 0.6～0.9。",
+                        )
+                        with gr.Row():
+                            exp_cone_deg = gr.Slider(
+                                10, 180, value=90, step=5, label="UV 分塊角度（°）",
+                                info="UV 展開時，表面法線方向差異在此角度內的面會分在同一塊。"
+                                     "調大：UV 塊數與接縫變少，貼圖空間利用率較高，但大塊 UV 的貼圖可能較扭曲；"
+                                     "調小：接縫多但每塊扭曲小。實測對 GLB 壓縮後的面數影響很小（90°→150° 約少 2%），"
+                                     "匯出時間略增。預設 90。",
+                            )
+                            exp_smooth = gr.Slider(
+                                0, 10, value=1, step=0.5, label="UV 分塊平滑度",
+                                info="分塊邊界的平滑強度。調高可讓分塊邊界更整齊、減少零碎小塊。預設 1。",
+                            )
+                        with gr.Row():
+                            exp_refine_iters = gr.Slider(
+                                0, 10, value=0, step=1, label="UV 分塊細化次數",
+                                info="對分塊結果做局部細化的次數。增加可減少不規則的小碎塊，匯出時間略增。預設 0。",
+                            )
+                            exp_global_iters = gr.Slider(
+                                1, 10, value=1, step=1, label="UV 分塊全域迭代次數",
+                                info="整體重新分配分塊的次數。增加可讓分塊更合理、塊數更少，匯出時間略增。預設 1。",
+                            )
+                        exp_alpha_mode = gr.Dropdown(
+                            list(ALPHA_MODES), value=list(ALPHA_MODES)[0], label="透明度模式",
+                            info="TRELLIS 會烘焙出透明度，但原版一律以不透明輸出。"
+                                 "不透明：忽略透明度（預設，效能最好）；"
+                                 "半透明混合：玻璃座艙罩、能量罩等半透明部件會正確顯示，但半透明物件在遊戲中排序與效能成本較高；"
+                                 "透明裁切：透明度低於 50% 的部分直接挖空（適合鏤空網格、葉片），不需排序。",
+                        )
+                        expert_reset_btn = gr.Button("還原專家設定預設值", size="sm")
+
+                with gr.Column(scale=7):
                     with gr.Walkthrough(selected=0) as walkthrough:
                         with gr.Step("預覽", id=0):
-                            view_mode = gr.Radio([VIEW_STATIC, VIEW_LIVE], value=VIEW_STATIC, show_label=False, container=False)
+                            candidate_pick = gr.Radio(
+                                [], label="候選模型",
+                                info="「專家設定 → 一次生成幾個候選」大於 1 時，可在這裡切換要使用哪一個（會重設 GLB 編輯狀態）。",
+                            )
+                            view_mode = gr.Radio(
+                                [VIEW_STATIC, VIEW_LIVE], value=VIEW_STATIC, label="預覽方式",
+                                info="靜態渲染預覽：生成後立即可看，6 種渲染模式 × 8 個視角；"
+                                     "即時 3D 檢視：自動匯出 GLB（約 30 秒）後用 three.js 自由旋轉縮放，並可使用 GLB 編輯功能。",
+                            )
                             preview_output = gr.HTML(empty_html, label="3D 素材預覽", show_label=True, container=True, elem_id="preview-static")
                             live_view = gr.HTML(live_viewer_html, label="即時 3D 檢視（three.js）", show_label=True, container=True, elem_id="preview-live")
                             with gr.Row():
                                 extract_btn = gr.Button("匯出 GLB")
                                 to_shrink_btn = gr.Button("送到 GLB 壓縮 ➜")
+                            gr.Markdown("*「匯出 GLB」：依目前的減面、貼圖、GLB 編輯與專家設定輸出可下載的 GLB；"
+                                        "「送到 GLB 壓縮」：把目前編輯好的模型帶到 GLB 壓縮分頁做 Draco + WebP 壓縮。*")
                         with gr.Step("匯出", id=1):
                             glb_output = gr.Model3D(label="已匯出的 GLB", height=724, show_label=True, display_mode="solid", clear_color=(0.25, 0.25, 0.25, 1.0))
                             download_btn = gr.DownloadButton(label="下載 GLB")
                             dims_md = gr.Markdown("")
                             to_shrink_btn2 = gr.Button("送到 GLB 壓縮 ➜")
                             gr.Markdown("*匯出 GLB 需要重新網格化、減面與材質烘焙，通常需要半分鐘以上，請耐心等候。*")
-
-                with gr.Column(scale=1, min_width=172):
-                    examples = gr.Examples(
-                        examples=[
-                            f'assets/example_image/{image}'
-                            for image in sorted(os.listdir("assets/example_image"))
-                        ],
-                        inputs=[image_prompt],
-                        fn=preprocess_image,
-                        outputs=[image_prompt],
-                        run_on_click=True,
-                        examples_per_page=18,
-                        label="範例",
-                    )
 
         with gr.Tab("GLB 壓縮", id="shrink"):
             # Mirrors github.com/lorenhsu1128/glb-shrink: hero strip, controls, before/after viewers
@@ -1952,8 +2222,17 @@ with gr.Blocks(delete_cache=(600, 600), title="TRELLIS.2 圖片轉 3D") as demo:
                     shrink_file = gr.File(label="拖放 GLB 檔（或點擊瀏覽 · 最大 200 MB）", file_types=[".glb"],
                                           type="filepath", height=140)
                     shrink_meta = gr.Markdown("")
-                    shrink_preset = gr.Radio(list(SHRINK_PRESETS), value=list(SHRINK_PRESETS)[1], label="要多清晰？")
-                    shrink_quality = gr.Slider(0, 100, value=50, step=1, label="檔案更小 ↔ 外觀更清晰")
+                    shrink_preset = gr.Radio(
+                        list(SHRINK_PRESETS), value=list(SHRINK_PRESETS)[1], label="要多清晰？",
+                        info="快速選擇壓縮強度，會同步設定下方滑桿（0 / 50 / 100）。"
+                             "最小檔案：貼圖縮到 256 px、減面最多，適合遠景道具；"
+                             "平衡：貼圖 384 px，多數遊戲物件適用；最清晰：貼圖 512 px、保留較多面，適合近距離主角。",
+                    )
+                    shrink_quality = gr.Slider(
+                        0, 100, value=50, step=1, label="檔案更小 ↔ 外觀更清晰",
+                        info="在三個預設之間連續微調：數值越低，減面比例越大、貼圖越小（256→512 px），檔案越小；"
+                             "越高細節越多、檔案越大。幾何一律用 Draco 壓縮、貼圖一律轉 WebP。",
+                    )
                     shrink_hint_md = gr.Markdown(shrink_hint(50))
                     shrink_btn = gr.Button("壓縮模型", variant="primary")
                     # Always rendered: a DownloadButton that starts hidden loses its file value when shown (Gradio 6)
@@ -1991,15 +2270,19 @@ with gr.Blocks(delete_cache=(600, 600), title="TRELLIS.2 圖片轉 3D") as demo:
         outputs=[image_prompt],
     )
 
+    # Reset export/edit state for a new model (new generation or another candidate)
+    def reset_for_new_model():
+        return (gr.Walkthrough(selected=0), VIEW_STATIC, None, "", "", gr.update(choices=[], value=[]), None, 0, 0, 0)
+
+    reset_outputs = [walkthrough, view_mode, glb_cache, live_glb_url, dims_md, keep_parts, origin_point,
+                     origin_dx, origin_dy, origin_dz]
+
     generate_btn.click(
         get_seed,
         inputs=[randomize_seed, seed],
         outputs=[seed],
     ).then(
-        lambda: (gr.Walkthrough(selected=0), VIEW_STATIC, None, "", "", gr.update(choices=[], value=[]), None, 0, 0, 0),
-        outputs=[walkthrough, view_mode, glb_cache, live_glb_url, dims_md, keep_parts, origin_point,
-                 origin_dx, origin_dy, origin_dz],
-        js=RESET_VIEW_JS,
+        reset_for_new_model, outputs=reset_outputs, js=RESET_VIEW_JS,
     ).then(
         image_to_3d,
         inputs=[
@@ -2007,12 +2290,22 @@ with gr.Blocks(delete_cache=(600, 600), title="TRELLIS.2 圖片轉 3D") as demo:
             ss_guidance_strength, ss_guidance_rescale, ss_sampling_steps, ss_rescale_t,
             shape_slat_guidance_strength, shape_slat_guidance_rescale, shape_slat_sampling_steps, shape_slat_rescale_t,
             tex_slat_guidance_strength, tex_slat_guidance_rescale, tex_slat_sampling_steps, tex_slat_rescale_t,
+            num_candidates, ss_interval_start, ss_interval_end, shape_interval_start, shape_interval_end,
+            tex_interval_start, tex_interval_end,
         ],
-        outputs=[output_buf, preview_output],
+        outputs=[output_buf, preview_output, candidate_pick],
     )
 
+    # Switching candidates behaves like a new generation for the export/edit state
+    candidate_pick.input(
+        reset_for_new_model, outputs=reset_outputs, js=RESET_VIEW_JS,
+    ).then(
+        select_candidate, inputs=[candidate_pick], outputs=[output_buf, preview_output],
+    )
+
+    expert_export = [exp_remesh_project, exp_cone_deg, exp_refine_iters, exp_global_iters, exp_smooth, exp_alpha_mode]
     export_inputs = [output_buf, decimation_target, texture_size, scale_mode, target_cm, rot_x, rot_y, rot_z,
-                     keep_parts, origin_mode, origin_point, origin_dx, origin_dy, origin_dz, glb_cache]
+                     keep_parts, origin_mode, origin_point, origin_dx, origin_dy, origin_dz, *expert_export, glb_cache]
     live_outputs = [glb_cache, live_glb_url, glb_output, download_btn, dims_md, keep_parts]
 
     view_mode.input(
@@ -2029,7 +2322,10 @@ with gr.Blocks(delete_cache=(600, 600), title="TRELLIS.2 圖片轉 3D") as demo:
     for trigger in [keep_parts.input, scale_mode.input, origin_mode.input,
                     rot_x.submit, rot_x.blur, rot_y.submit, rot_y.blur, rot_z.submit, rot_z.blur,
                     origin_dx.submit, origin_dx.blur, origin_dy.submit, origin_dy.blur,
-                    origin_dz.submit, origin_dz.blur, target_cm.submit, target_cm.blur]:
+                    origin_dz.submit, origin_dz.blur, target_cm.submit, target_cm.blur,
+                    # Expert export options (remesh / UV changes rebuild the raw GLB, ~30 s)
+                    exp_remesh_project.release, exp_cone_deg.release, exp_refine_iters.release,
+                    exp_global_iters.release, exp_smooth.release, exp_alpha_mode.input]:
         trigger(
             refresh_transformed_glb,
             inputs=[view_mode, *export_inputs],
@@ -2037,6 +2333,18 @@ with gr.Blocks(delete_cache=(600, 600), title="TRELLIS.2 圖片轉 3D") as demo:
         ).then(
             lambda url: gr.skip(), inputs=[live_glb_url], outputs=[live_glb_url], js=LOAD_GLB_JS,
         )
+
+    expert_reset_btn.click(
+        lambda: (1, 0.6, 1.0, 0.6, 1.0, 0.6, 0.9, 0.0, 90, 0, 1, 1, list(ALPHA_MODES)[0]),
+        outputs=[num_candidates, ss_interval_start, ss_interval_end, shape_interval_start, shape_interval_end,
+                 tex_interval_start, tex_interval_end, *expert_export],
+    ).then(
+        refresh_transformed_glb,
+        inputs=[view_mode, *export_inputs],
+        outputs=live_outputs,
+    ).then(
+        lambda url: gr.skip(), inputs=[live_glb_url], outputs=[live_glb_url], js=LOAD_GLB_JS,
+    )
 
     origin_offset_reset.click(
         lambda: (0, 0, 0), outputs=[origin_dx, origin_dy, origin_dz],
