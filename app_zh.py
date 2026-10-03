@@ -13,6 +13,7 @@ import torch
 import numpy as np
 from PIL import Image
 import base64
+import html
 import io
 import uuid
 import time
@@ -80,12 +81,29 @@ SHRINK_PRESETS = {
     "⚖️ 平衡 — 大多數專案（建議）": 50,
     "✨ 最清晰 — 近距離或主角物件": 100,
 }
-VIEW_STATIC = "靜態渲染預覽"
-VIEW_LIVE = "即時 3D 檢視"
-LIVE_IDLE_TEXT = "切換到「即時 3D 檢視」時，會自動以目前的減面與貼圖設定匯出 GLB 並載入"
+VIEW_STATIC = "靜態渲染"
+VIEW_LIVE = "即時 3D"
+LIVE_IDLE_TEXT = "按右欄「匯出 GLB」或切換到「即時 3D」，會以目前的面數與貼圖設定匯出 GLB 並載入"
+# Face-count presets for the decimation target (the number field next to them takes any value)
+FACE_PRESETS = {"2 萬": 20000, "10 萬": 100000, "50 萬": 500000}
+FACE_CUSTOM = "自訂"
+TEXTURE_SIZES = [("1K", 1024), ("2K", 2048), ("4K", 4096)]
+# Parameter help: "<one-line hint>§<full explanation>"; client-side js moves the part after
+# the separator into an ⓘ popover (hover on desktop, tap on touch screens).
+TIP_SEP = "§"
+
+
+def tip(hint: str, detail: str) -> str:
+    return f"{hint}{TIP_SEP}{detail}"
+
+
+def tip_html(text: str, label: str = "ⓘ", cls: str = "") -> str:
+    """A standalone ⓘ button whose popover shows text (newlines are kept)."""
+    return (f'<button type="button" class="tip-btn {cls}" aria-label="詳細說明" '
+            f'data-tip="{html.escape(text, quote=True)}">{label}</button>')
 # Real-world size / orientation of the exported GLB (glTF unit = meter, Y-up).
 # Generated assets are normalized so the longest side is ~1 m regardless of the object.
-SCALE_NONE = "不縮放（最長邊約 100 cm）"
+SCALE_NONE = "不縮放"
 SCALE_AXES = {"最長邊": None, "X 軸（寬）": 0, "Y 軸（高）": 1, "Z 軸（深）": 2}
 SCALE_MODES = [SCALE_NONE] + list(SCALE_AXES)
 ORIGIN_CENTER = "幾何中心"
@@ -186,9 +204,9 @@ css = """
     position: relative;
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
     width: 100%;
-    height: clamp(420px, calc(100vh - 380px), 722px);  /* fit the sticky middle panel */
+    height: 100%;  /* fills the viewer area of the workspace */
     margin: 0 auto;
-    padding: 20px;
+    padding: 12px 16px;
     display: flex;
     flex-direction: column;
     align-items: center;
@@ -239,7 +257,7 @@ css = """
     display: flex;
     gap: 8px;
     justify-content: center;
-    margin-bottom: 20px;
+    margin-bottom: 10px;
     flex-wrap: wrap;
 }
 .previewer-container .mode-btn {
@@ -261,8 +279,8 @@ css = """
 
 /* Row 2: Display Image */
 .previewer-container .display-row {
-    margin-bottom: 20px;
-    min-height: 400px;
+    margin-bottom: 10px;
+    min-height: 0;
     width: 100%;
     flex-grow: 1;
     display: flex;
@@ -332,24 +350,298 @@ css = """
 /* Live three.js viewer */
 #live-glb-url, #origin-pick-box, #origin-pick-btn, #shrink-view-json { display: none !important; }
 
-/* 圖片轉 3D: three panels. Side panels stick to the viewport and scroll on their own,
-   so the preview in the middle stays visible while adjusting parameters. */
-#col-left, #col-mid, #col-right {
-    position: sticky;
-    top: 8px;
-    align-self: flex-start;
+/* ===== App shell: the page itself does not scroll on laptops/desktops; the viewer fills the
+   space between the side panels and each panel scrolls on its own with its main button pinned
+   to the bottom. --ws-top (top of the workspace) is measured by js. ===== */
+:root {
+    --ws-top: 100px;
+    --panel-l: 290px;
+    --panel-r: 310px;
+    --ws-gap: 10px;
 }
-#col-left, #col-mid, #col-right {
-    max-height: calc(100vh - 16px);
+footer { display: none !important; }
+/* clip (unlike hidden) does not create a scroll container, so sticky footers work on phones */
+.gradio-container { padding-top: 0 !important; padding-bottom: 0 !important; overflow: clip !important; }
+.gradio-container > main { padding-top: 0 !important; padding-bottom: 0 !important; }
+
+/* Brand + help on the same row as the tab buttons */
+#topbar {
+    position: absolute !important;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 0;
+    padding: 0 !important;
+    border: none !important;
+    background: none !important;
+    z-index: 30;
+    overflow: visible !important;
+}
+.topbar {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 42px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    pointer-events: none;
+}
+.topbar > * { pointer-events: auto; }
+.topbar .brand { font-weight: 800; font-size: 17px; color: var(--body-text-color); text-decoration: none; }
+
+.topbar .help-btn { margin-left: auto; }
+#main-tabs > .tab-wrapper { padding-left: 120px; padding-right: 110px; min-height: 42px; }
+#main-tabs > .tabitem { padding: 6px 0 0 !important; border: none !important; }
+
+/* Workspace grid */
+.ws {
+    display: grid !important;
+    gap: var(--ws-gap);
+    height: calc(100dvh - var(--ws-top) - 10px);
+    min-height: 480px;
+    flex-wrap: nowrap !important;
+}
+.ws > * { min-width: 0 !important; }
+#ws {
+    grid-template-columns: var(--panel-l) minmax(0, 1fr) var(--panel-r);
+    grid-template-rows: minmax(0, 1fr);
+    grid-template-areas: "left mid right";
+}
+#ws-shrink {
+    grid-template-columns: var(--panel-r) minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1fr);
+    grid-template-areas: "left mid";
+}
+#col-left, #shrink-left { grid-area: left; }
+#col-mid, #shrink-mid { grid-area: mid; }
+#col-right { grid-area: right; }
+
+/* Side panels: header, scrolling body, pinned footer */
+.side-panel {
+    display: flex !important;
+    flex-direction: column !important;
+    flex-wrap: nowrap !important;
+    gap: 0 !important;
+    height: 100%;
+    min-height: 0;
+    overflow: hidden;
+    border: 1px solid var(--border-color-primary);
+    border-radius: 12px;
+    background: var(--background-fill-secondary);
+}
+.panel-scroll {
+    flex: 1 1 auto !important;
+    min-height: 0;
     overflow-y: auto;
     overflow-x: hidden;
     overscroll-behavior: contain;
-    padding-right: 4px;
-    /* Gradio columns wrap by default: with a max-height, overflowing children would
-       wrap into a second column instead of scrolling */
     flex-wrap: nowrap !important;
+    gap: 8px !important;
+    padding: 8px;
 }
-#col-left > *, #col-mid > *, #col-right > * { flex-shrink: 0; }
+/* Gradio columns carry an inline flex-grow; inside a panel they must keep their natural height */
+.panel-scroll > * { flex-shrink: 0; flex-grow: 0 !important; }
+.panel-foot {
+    flex: 0 0 auto !important;
+    gap: 6px !important;
+    padding: 8px;
+    border-top: 1px solid var(--border-color-primary);
+    background: var(--background-fill-secondary);
+}
+.panel-head {
+    display: flex;
+    gap: 4px;
+    padding: 8px 10px 6px;
+    border-bottom: 1px solid var(--border-color-primary);
+}
+.panel-head-wrap { padding: 0 !important; border: none !important; background: none !important; flex: 0 0 auto !important; }
+.side-tab, .panel-title {
+    border: none;
+    background: none;
+    padding: 4px 8px;
+    border-radius: 8px;
+    font-size: 15px;
+    font-weight: 700;
+    color: var(--body-text-color);
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+}
+/* Wide screens: each panel header just shows its own title */
+.side-tab { display: none; }
+.side-tab.own { display: inline-flex; pointer-events: none; }
+.foot-row { gap: 6px !important; flex-wrap: nowrap !important; }
+.foot-row > * { min-width: 0 !important; }
+#generate-btn, #extract-btn { min-height: 44px; font-size: 16px; }
+#dims-md { min-height: 0; padding: 0 2px; }
+#dims-md p { margin: 0; font-size: 12px; color: var(--body-text-color-subdued); }
+
+/* Viewer column */
+#col-mid, #shrink-mid {
+    display: flex !important;
+    flex-direction: column !important;
+    flex-wrap: nowrap !important;
+    gap: 6px !important;
+    min-height: 0;
+    height: 100%;
+}
+#viewer-toolbar { flex: 0 0 auto !important; gap: 8px !important; align-items: center; flex-wrap: wrap !important; }
+#viewer-toolbar > * { flex: 0 1 auto !important; min-width: 0 !important; width: auto !important; }
+#cand:not(:has(input)) { display: none !important; }
+#preview-static, #preview-live, #shrink-viewers-block {
+    flex: 1 1 0 !important;
+    min-height: 0 !important;
+    display: flex !important;
+    flex-direction: column;
+    padding: 0 !important;
+    overflow: hidden !important;
+}
+#preview-static, #preview-live {
+    border: 1px solid var(--border-color-primary) !important;
+    border-radius: 12px !important;
+    background: var(--background-fill-secondary) !important;
+}
+#preview-static > .html-container, #preview-live > .html-container, #shrink-viewers-block > .html-container,
+#preview-static .prose, #preview-live .prose, #shrink-viewers-block .prose {
+    flex: 1 1 auto;
+    min-height: 0;
+    height: 100%;
+    max-width: none;
+}
+
+/* Segmented controls (radio groups rendered as button bars) */
+.seg .wrap { display: flex !important; flex-wrap: nowrap !important; gap: 0 !important; }
+.seg .wrap label {
+    flex: 1 1 0;
+    justify-content: center;
+    margin: 0 !important;
+    border-radius: 0 !important;
+    padding: 6px 8px !important;
+    min-height: 36px;
+    white-space: nowrap;
+}
+.seg .wrap label:first-child { border-radius: 8px 0 0 8px !important; }
+.seg .wrap label:last-child { border-radius: 0 8px 8px 0 !important; }
+.seg .wrap label + label { margin-left: -1px !important; }
+.seg .wrap label input { display: none; }
+.seg .wrap label.selected { background: var(--color-accent) !important; color: #fff !important; border-color: var(--color-accent) !important; }
+.seg.seg-wrap .wrap { flex-wrap: wrap !important; }
+
+/* Compact rows */
+.seed-row, .rot-row, .xyz-row, .scale-row { gap: 6px !important; flex-wrap: nowrap !important; align-items: flex-end; }
+.seed-row > *, .rot-row > *, .xyz-row > *, .scale-row > * { min-width: 0 !important; }
+.seed-row > .form, .rot-row > .form, .scale-row > .form { flex: 1 1 0 !important; }
+.seed-group {
+    padding: 10px 12px !important;
+    gap: 6px !important;
+    background: var(--block-background-fill);
+    border: 1px solid var(--block-border-color);
+    border-radius: var(--block-radius);
+}
+.seed-group .sub-head { margin: 0 0 2px; }
+.seed-row { align-items: center; }
+.seed-row input[type=number], .xyz-row input[type=number] { height: 40px; }
+.icon-btn { flex: 0 0 auto !important; min-width: 40px !important; max-width: 48px; height: 40px; padding: 0 !important; font-size: 18px; }
+.rot-row .icon-btn, .xyz-row .icon-btn { max-width: 56px; font-size: 13px; }
+.lock-seed { flex: 0 0 auto !important; width: auto !important; padding: 0 !important; border: none !important; background: none !important; }
+.lock-seed label { min-height: 40px; display: flex; align-items: center; white-space: nowrap; }
+.rot-row { align-items: center; }
+.axis-chip-wrap { flex: 0 0 auto !important; min-width: 0 !important; width: auto !important; padding: 0 !important; }
+.axis-chip {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 26px;
+    height: 26px;
+    border-radius: 6px;
+    font-weight: 800;
+    font-size: 13px;
+    color: #fff;
+}
+.axis-chip.x { background: #e5484d; }
+.axis-chip.y { background: #30a46c; }
+.axis-chip.z { background: #3e7bfa; }
+.rot-row input[type=number] { height: 40px; text-align: center; }
+.sub-head { font-weight: 700; font-size: 13px; margin: 6px 2px 0; display: flex; align-items: center; gap: 6px; }
+.hint-line { font-size: 12px; color: var(--body-text-color-subdued); margin: 0 2px; line-height: 1.5; }
+#input-image { flex-shrink: 0; }
+#input-image .image-container, #input-image .upload-container { height: clamp(170px, 26vh, 300px) !important; }
+
+/* ⓘ help buttons and their popover */
+.tip-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 22px;
+    height: 22px;
+    padding: 0 4px;
+    margin-left: 2px;
+    border: none;
+    border-radius: 11px;
+    background: transparent;
+    color: var(--color-accent);
+    font-size: 15px;
+    line-height: 1;
+    cursor: help;
+    vertical-align: middle;
+}
+.tip-btn:hover { background: var(--background-fill-secondary); }
+.tip-btn.help-btn { font-size: 14px; padding: 0 10px; height: 30px; border: 1px solid var(--border-color-primary); }
+#tip-pop {
+    position: fixed;
+    z-index: 1000;
+    max-width: 360px;
+    padding: 10px 12px;
+    border-radius: 10px;
+    background: #1f2430;
+    color: #f3f4f6;
+    font-size: 13px;
+    line-height: 1.6;
+    white-space: pre-line;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.25);
+    opacity: 0;
+    visibility: hidden;
+    transition: opacity 0.12s;
+    pointer-events: none;
+}
+#tip-pop.show { opacity: 1; visibility: visible; pointer-events: auto; }
+
+/* Large desktops */
+@media (min-width: 1440px) {
+    .ws { --panel-l: 330px; --panel-r: 360px; }
+}
+/* Small laptops / tablets in landscape: viewer + one side panel; the panel headers become tabs */
+@media (max-width: 1099px) {
+    #ws {
+        grid-template-columns: minmax(0, 1fr) 330px;
+        grid-template-areas: "mid side";
+    }
+    #col-left, #col-right { grid-area: side; }
+    /* Gradio prefixes rules inside @media with .gradio-container, so state lives on #ws, not body */
+    #ws:not([data-side="right"]) #col-right { display: none !important; }
+    #ws[data-side="right"] #col-left { display: none !important; }
+    .side-tab { display: inline-flex; pointer-events: auto; cursor: pointer; font-size: 14px; flex: 1 1 0; justify-content: center; border: 1px solid var(--border-color-primary); }
+    .side-tab.active { background: var(--color-accent); color: #fff; border-color: var(--color-accent); }
+    .side-tab.own:not(.active) { pointer-events: auto; }
+    #main-tabs > .tab-wrapper { padding-left: 110px; }
+
+}
+/* Tablets in portrait / phones: one column, the page scrolls, main buttons stick to the bottom */
+@media (max-width: 759px) {
+    .ws { height: auto; min-height: 0; }
+    #ws, #ws-shrink { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto; grid-template-areas: "mid" "side"; }
+    #shrink-left { grid-area: side; }
+    #col-mid { height: 52vh; min-height: 320px; }
+    #shrink-mid { height: auto; }
+    .side-panel { height: auto; overflow: visible; }
+    .panel-scroll { overflow: visible; }
+    .panel-foot { position: sticky; bottom: 0; z-index: 20; box-shadow: 0 -4px 12px rgba(0, 0, 0, 0.08); }
+    #main-tabs > .tab-wrapper { padding-left: 96px; padding-right: 44px; }
+    .topbar .brand { font-size: 15px; }
+    .help-btn .help-text { display: none; }
+}
 
 /* GLB 壓縮 tab (styled after glb-shrink) */
 .shrink-hero {
@@ -373,7 +665,7 @@ css = """
     flex-wrap: wrap;
     font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
     font-weight: 700;
-    font-size: clamp(32px, 5vw, 60px);
+    font-size: clamp(26px, 2.6vw, 40px);
     line-height: 1.1;
 }
 .shrink-before { color: #f87171; text-decoration: line-through; text-decoration-thickness: 3px; }
@@ -396,12 +688,12 @@ css = """
 .shrink-viewers {
     display: grid;
     grid-template-columns: 1fr 1fr;
-    gap: 12px;
-    height: 640px;
+    gap: 10px;
+    height: 100%;
 }
-@media (max-width: 900px) {
+@media (max-width: 899px) {
     .shrink-viewers { grid-template-columns: 1fr; height: auto; }
-    .shrink-card { height: 420px; }
+    .shrink-card { height: 46vh; min-height: 300px; }
 }
 .shrink-card {
     position: relative;
@@ -450,8 +742,9 @@ css = """
 }
 .shrink-empty.hidden { display: none; }
 
-body:not(.live-mode) #preview-live { display: none !important; }
-body.live-mode #preview-static { display: none !important; }
+/* Extra id so these beat the (Gradio-prefixed) display rule of the viewer blocks */
+body:not(.live-mode) #col-mid #preview-live { display: none !important; }
+body.live-mode #col-mid #preview-static { display: none !important; }
 
 .gradio-container .padded:has(.live-viewer-container) {
     padding: 0 !important;
@@ -460,7 +753,7 @@ body.live-mode #preview-static { display: none !important; }
 .live-viewer-container {
     position: relative;
     width: 100%;
-    height: clamp(420px, calc(100vh - 380px), 722px);  /* fit the sticky middle panel */
+    height: 100%;  /* fills the viewer area of the workspace */
     overflow: hidden;
     border-radius: var(--block-radius);
     background: #404040;
@@ -584,6 +877,138 @@ head = """
     function onSliderChange(val) {
         refreshView(-1, parseInt(val));
     }
+
+    // --- App shell: ⓘ help popovers, side-panel tabs, workspace height, Chinese progress labels ---
+    (function () {
+        const SEP = '__TIP_SEP__';
+        // tqdm descriptions shown in Gradio's progress overlay (longest keys first)
+        const PROGRESS_ZH = [
+            ['Sampling sparse structure', '生成 1/3：稀疏結構'],
+            ['Sampling shape SLat', '生成 2/3：形狀'],
+            ['Sampling texture SLat', '生成 3/3：材質'],
+            ['Parameterizing new mesh', '匯出：UV 展開'],
+            ['Sampling attributes', '匯出：烘焙材質'],
+            ['Extracting GLB', '匯出 GLB（重新網格化與烘焙材質）'],
+            ['Building BVH', '匯出：建立加速結構'],
+            ['Cleaning mesh', '匯出：清理網格'],
+            ['Finalizing mesh', '匯出：完成網格'],
+            ['Rendering', '渲染預覽圖'],
+        ];
+
+        // Gradio renders `info` as markdown: "<hint>§<detail>" -> hint text + ⓘ holding the detail
+        function processTips() {
+            document.querySelectorAll('.md p').forEach((p) => {
+                const t = p.textContent, i = t.indexOf(SEP);
+                if (i < 0 || p.querySelector('.tip-btn')) return;
+                const btn = document.createElement('button');
+                btn.type = 'button';
+                btn.className = 'tip-btn';
+                btn.textContent = 'ⓘ';
+                btn.setAttribute('aria-label', '詳細說明');
+                btn.dataset.tip = t.slice(i + SEP.length).trim();
+                p.textContent = t.slice(0, i).trim() + ' ';
+                p.appendChild(btn);
+            });
+        }
+
+        let pop = null, popFor = null;
+        const canHover = window.matchMedia('(hover: hover)');
+        function showTip(btn) {
+            if (!pop) {
+                pop = document.createElement('div');
+                pop.id = 'tip-pop';
+                document.body.appendChild(pop);
+            }
+            pop.textContent = btn.dataset.tip || '';
+            pop.style.maxWidth = Math.min(360, window.innerWidth - 16) + 'px';
+            pop.style.left = '0px';
+            pop.style.top = '0px';
+            pop.classList.add('show');
+            popFor = btn;
+            const r = btn.getBoundingClientRect(), pw = pop.offsetWidth, ph = pop.offsetHeight;
+            const left = Math.min(Math.max(8, r.left + r.width / 2 - pw / 2), window.innerWidth - pw - 8);
+            let top = r.bottom + 6;
+            if (top + ph > window.innerHeight - 8) top = Math.max(8, r.top - ph - 6);
+            pop.style.left = left + 'px';
+            pop.style.top = top + 'px';
+        }
+        function hideTip() {
+            if (pop) pop.classList.remove('show');
+            popFor = null;
+        }
+        const tipOf = (e) => e.target && e.target.closest ? e.target.closest('.tip-btn') : null;
+        document.addEventListener('mouseover', (e) => { const b = tipOf(e); if (b && canHover.matches) showTip(b); });
+        document.addEventListener('mouseout', (e) => {
+            const b = tipOf(e);
+            if (b && canHover.matches && !b.contains(e.relatedTarget)) hideTip();
+        });
+        // Capture phase: an ⓘ inside a <label> must not toggle/focus the control
+        document.addEventListener('click', (e) => {
+            const b = tipOf(e);
+            if (b) {
+                e.preventDefault();
+                e.stopPropagation();
+                if (popFor === b && !canHover.matches) hideTip(); else showTip(b);
+                return;
+            }
+            if (!(e.target.closest && e.target.closest('#tip-pop'))) hideTip();
+        }, true);
+        window.addEventListener('scroll', hideTip, true);
+
+        // Narrow screens show one side panel at a time; the panel headers act as tabs
+        document.addEventListener('click', (e) => {
+            const t = e.target.closest ? e.target.closest('.side-tab') : null;
+            if (!t) return;
+            const right = t.dataset.side === 'right';
+            const ws = document.getElementById('ws');
+            if (ws) ws.dataset.side = right ? 'right' : 'left';
+            document.querySelectorAll('.side-tab').forEach((b) => b.classList.toggle('active', (b.dataset.side === 'right') === right));
+        });
+
+        // The workspace fills the window below its own top edge
+        function layoutWs() {
+            const ws = Array.from(document.querySelectorAll('.ws')).find((w) => w.offsetParent);
+            if (!ws) return;
+            const top = Math.round(ws.getBoundingClientRect().top + window.scrollY);
+            document.documentElement.style.setProperty('--ws-top', top + 'px');
+        }
+
+        function translateProgress(node) {
+            const el = node.nodeType === 3 ? node.parentElement : node;
+            const tracker = el && el.closest ? el.closest('[data-testid="status-tracker"]') : null;
+            if (!tracker) return;
+            const walker = document.createTreeWalker(tracker, NodeFilter.SHOW_TEXT);
+            for (let n = walker.nextNode(); n; n = walker.nextNode()) {
+                let s = n.data, changed = false;
+                for (const [en, zh] of PROGRESS_ZH) {
+                    if (s.includes(en)) { s = s.split(en).join(zh); changed = true; }
+                }
+                if (changed) n.data = s;
+            }
+        }
+
+        let queued = false;
+        const observer = new MutationObserver((mutations) => {
+            for (const m of mutations) {
+                translateProgress(m.target);
+                m.addedNodes.forEach(translateProgress);
+            }
+            if (queued) return;
+            queued = true;
+            requestAnimationFrame(() => {
+                queued = false;
+                processTips();
+                layoutWs();
+            });
+        });
+        function start() {
+            observer.observe(document.body, { childList: true, subtree: true, characterData: true });
+            processTips();
+            layoutWs();
+        }
+        if (document.body) start(); else document.addEventListener('DOMContentLoaded', start);
+        window.addEventListener('resize', layoutWs);
+    })();
 </script>
 <script type="module">
     import * as THREE from '__THREE_BASE__/three.module.js';
@@ -1120,7 +1545,7 @@ head = """
 </script>
 """.replace('__THREE_BASE__', f'/gradio_api/file={THREE_DIR}').replace('__IDLE_TEXT__', LIVE_IDLE_TEXT).replace(
     '__HOME_YAW__', str(round(np.degrees(DEFAULT_STEP * 2 * np.pi / STEPS - 16 / 180 * np.pi), 3))
-)
+).replace('__TIP_SEP__', TIP_SEP)
 
 
 live_viewer_html = f"""
@@ -1142,12 +1567,24 @@ TOGGLE_VIEW_JS = f"""
     const v = window.trellisViewer;
     if (live && v) {{
         v.init();
-        if (!v.hasModel()) v.setStatus('正在匯出 GLB，約需半分鐘…');
+        if (!v.hasModel()) v.setStatus('正在匯出 GLB（重新網格化與烘焙材質）…');
     }}
     return [mode, ...rest];
 }}
 """
 LOAD_GLB_JS = "(url) => { if (url && window.trellisViewer) window.trellisViewer.load(url); return url; }"
+# After "匯出 GLB" finishes: show the exported model in the live viewer
+SHOW_LIVE_JS = """
+(url) => {
+    const v = window.trellisViewer;
+    if (url && v) {
+        document.body.classList.add('live-mode');
+        v.init();
+        v.load(url);
+    }
+    return url;
+}
+"""
 SHRINK_VIEW_JS = "(v) => { if (window.shrinkView) window.shrinkView.load(v); return v; }"
 
 # Before/after viewers for the GLB 壓縮 tab (layout from glb-shrink)
@@ -1238,11 +1675,11 @@ def unpack_state(state: dict) -> Tuple[SparseTensor, SparseTensor, int]:
     return shape_slat, tex_slat, state['res']
 
 
-def get_seed(randomize_seed: bool, seed: int) -> int:
+def get_seed(lock_seed: bool, seed: int) -> int:
     """
-    Get the random seed.
+    Get the random seed: a new one per generation unless the seed is locked.
     """
-    return np.random.randint(0, MAX_SEED) if randomize_seed else seed
+    return int(seed or 0) if lock_seed else int(np.random.randint(0, MAX_SEED))
 
 
 def image_to_3d(
@@ -1387,14 +1824,6 @@ def build_preview_html(images: dict) -> str:
     # Assemble the full component
     full_html = f"""
     <div class="previewer-container">
-        <div class="tips-wrapper">
-            <div class="tips-icon">💡提示</div>
-            <div class="tips-text">
-                <p>● <b>渲染模式</b> - 點選下方圓形按鈕切換不同的渲染模式。</p>
-                <p>● <b>視角</b> - 拖曳滑桿改變觀看角度。</p>
-            </div>
-        </div>
-        
         <!-- Row 1: Viewport containing 48 static <img> tags -->
         <div class="display-row">
             {images_html}
@@ -1407,7 +1836,7 @@ def build_preview_html(images: dict) -> str:
 
         <!-- Row 3: Slider -->
         <div class="slider-row">
-            <input type="range" id="custom-slider" min="0" max="{STEPS - 1}" value="{DEFAULT_STEP}" step="1" oninput="onSliderChange(this.value)">
+            <input type="range" id="custom-slider" min="0" max="{STEPS - 1}" value="{DEFAULT_STEP}" step="1" oninput="onSliderChange(this.value)" title="拖曳切換觀看角度（上方圓形按鈕切換渲染模式）">
         </div>
     </div>
     """
@@ -1415,7 +1844,7 @@ def build_preview_html(images: dict) -> str:
     return full_html
 
 
-def extract_glb(
+def export_to_viewer(
     state: dict,
     decimation_target: int,
     texture_size: int,
@@ -1441,20 +1870,8 @@ def extract_glb(
     progress=gr.Progress(track_tqdm=True),
 ):
     """
-    Extract a GLB file from the 3D model.
-
-    Args:
-        state (dict): The state of the generated 3D model.
-        decimation_target (int): The target face count for decimation.
-        texture_size (int): The texture resolution.
-        scale_mode, target_cm: Which axis to scale to which real-world length.
-        rot_x, rot_y, rot_z: Orientation correction in degrees, applied before scaling.
-        keep_parts: Labels of the separated parts to keep (empty = all).
-        origin_mode, origin_point: Where the GLB origin goes (origin_point is in the raw mesh frame).
-        glb_cache (dict): The GLB already exported for the current generation, if any.
-
-    Returns:
-        str: The path to the extracted GLB file.
+    "匯出 GLB": export (or reuse) the GLB with the current settings, enable the download, and
+    switch the viewer to the live three.js view of the exported file.
     """
     if state is None:
         raise gr.Error("請先按「生成」建立 3D 素材。")
@@ -1464,7 +1881,12 @@ def extract_glb(
                                   make_export_opts(exp_remesh_project, exp_cone_deg, exp_refine_iters,
                                                    exp_global_iters, exp_smooth, exp_alpha_mode))
     path = glb_cache['path']
-    return path, path, glb_cache, format_dims(glb_cache['dims']), parts_update(glb_cache)
+    return (VIEW_LIVE, glb_cache, f"/gradio_api/file={path}", download_update(path),
+            format_dims(glb_cache['dims']), parts_update(glb_cache))
+
+
+def download_update(path: Optional[str]):
+    return gr.update(value=path, interactive=bool(path))
 
 
 def prepare_live_glb(
@@ -1494,20 +1916,20 @@ def prepare_live_glb(
     progress=gr.Progress(track_tqdm=True),
 ):
     """
-    Export (or reuse) the GLB for the live three.js viewer, and sync it to the Extract step.
+    Export (or reuse) the GLB for the live three.js viewer, and enable its download.
     """
     if mode != VIEW_LIVE:
-        return (gr.skip(),) * 6
+        return (gr.skip(),) * 5
     if state is None:
         gr.Info("請先按「生成」建立 3D 素材，再切換到即時 3D 檢視。")
-        return gr.skip(), "", gr.skip(), gr.skip(), gr.skip(), gr.skip()
+        return gr.skip(), "", gr.skip(), gr.skip(), gr.skip()
     edit = make_edit(scale_mode, target_cm, rot_x, rot_y, rot_z, keep_parts, origin_mode, origin_point,
                      origin_dx, origin_dy, origin_dz)
     glb_cache = get_or_export_glb(state, decimation_target, texture_size, edit, glb_cache, req,
                                   make_export_opts(exp_remesh_project, exp_cone_deg, exp_refine_iters,
                                                    exp_global_iters, exp_smooth, exp_alpha_mode))
     path = glb_cache['path']
-    return glb_cache, f"/gradio_api/file={path}", path, path, format_dims(glb_cache['dims']), parts_update(glb_cache)
+    return glb_cache, f"/gradio_api/file={path}", download_update(path), format_dims(glb_cache['dims']), parts_update(glb_cache)
 
 
 def refresh_transformed_glb(
@@ -1540,7 +1962,7 @@ def refresh_transformed_glb(
     (fast: reuses the raw mesh). Does nothing until a GLB has been exported for the current generation.
     """
     if state is None or glb_cache is None:
-        return (gr.skip(),) * 6
+        return (gr.skip(),) * 5
     if not keep_parts and len(glb_cache.get('labels', [])) > 1:
         gr.Warning("至少要保留一個部件，已恢復為保留全部。")
     if origin_mode == ORIGIN_CUSTOM and origin_point is None:
@@ -1552,7 +1974,7 @@ def refresh_transformed_glb(
                                                    exp_global_iters, exp_smooth, exp_alpha_mode))
     path = glb_cache['path']
     url = f"/gradio_api/file={path}" if mode == VIEW_LIVE else gr.skip()
-    return glb_cache, url, path, path, format_dims(glb_cache['dims']), parts_update(glb_cache)
+    return glb_cache, url, download_update(path), format_dims(glb_cache['dims']), parts_update(glb_cache)
 
 
 def set_origin_from_pick(
@@ -1590,7 +2012,7 @@ def set_origin_from_pick(
     except (TypeError, ValueError):
         point = None
     if state is None or glb_cache is None or point is None:
-        return (gr.skip(),) * 11
+        return (gr.skip(),) * 10
     raw_point = trimesh.transform_points(point[None], np.linalg.inv(np.array(glb_cache['matrix'])))[0].tolist()
     edit = make_edit(scale_mode, target_cm, rot_x, rot_y, rot_z, keep_parts, ORIGIN_CUSTOM, raw_point, 0, 0, 0)
     glb_cache = get_or_export_glb(state, decimation_target, texture_size, edit, glb_cache, req,
@@ -1598,7 +2020,7 @@ def set_origin_from_pick(
                                                    exp_global_iters, exp_smooth, exp_alpha_mode))
     path = glb_cache['path']
     url = f"/gradio_api/file={path}" if mode == VIEW_LIVE else gr.skip()
-    return (glb_cache, url, path, path, format_dims(glb_cache['dims']), parts_update(glb_cache),
+    return (glb_cache, url, download_update(path), format_dims(glb_cache['dims']), parts_update(glb_cache),
             ORIGIN_CUSTOM, raw_point, 0, 0, 0)
 
 
@@ -1627,8 +2049,7 @@ def format_dims(dims: Optional[List[float]]) -> str:
     if not dims:
         return ""
     x, y, z = (d * 100 for d in dims)
-    return (f"**模型尺寸**：寬（X）{x:.1f} cm × 高（Y）{y:.1f} cm × 深（Z）{z:.1f} cm"
-            f"　*（glTF 單位為公尺，three.js 中 1 單位 = 1 m）*")
+    return f"已匯出　寬 {x:.1f} × 高 {y:.1f} × 深 {z:.1f} cm"
 
 
 def transform_matrix(points: np.ndarray, scale_mode: str, target_cm: float,
@@ -2021,277 +2442,336 @@ def send_to_shrink(
     return (glb_cache, gr.Tabs(selected="shrink"), None, *shrink_ingest(glb_cache['path'], name, req))
 
 
-with gr.Blocks(delete_cache=(600, 600), title="TRELLIS.2 圖片轉 3D") as demo:
-    gr.Markdown("""
-    ## 使用 [TRELLIS.2](https://microsoft.github.io/TRELLIS.2) 將圖片轉成 3D 素材
-    * 上傳一張圖片（建議使用已去背、帶透明通道的前景物件），按下「生成」即可建立 3D 素材。
-    * 對結果滿意的話，按「匯出 GLB」即可匯出並下載 GLB 檔；不滿意可以換個隨機種子再試一次。
-    * *註：上傳的圖片只會暫存在本機伺服器，工作階段結束後即刪除，不會上傳到任何外部服務。*
-    """)
+HELP_TEXT = """使用流程
+1. 左欄上傳圖片，按「生成」。建議使用已去背、帶透明通道的單一物件；正面或 3/4 角度效果最好。
+2. 中間檢視器預覽結果。不滿意可以直接再按「生成」換一個種子，或在「候選數量」一次生成多個再挑選。
+3. 右欄選擇面數與貼圖尺寸，按「匯出 GLB」。匯出後會切換到可旋轉的即時 3D，並可在「GLB 編輯」調整部件、尺寸、方向與原點，再下載或送到 GLB 壓縮。
 
-    with gr.Tabs(selected="gen") as tabs:
+每個參數旁的 ⓘ 有詳細說明（滑鼠移上去或點一下）。
+
+上傳的圖片只會暫存在本機伺服器，工作階段結束後即刪除，不會上傳到任何外部服務。"""
+
+topbar_html = f"""
+<div class="topbar">
+    <a class="brand" href="https://microsoft.github.io/TRELLIS.2" target="_blank" rel="noopener">TRELLIS.2</a>
+    {tip_html(HELP_TEXT, 'ⓘ<span class="help-text">&nbsp;使用說明</span>', "help-btn")}
+</div>
+"""
+
+
+def panel_head(own: str) -> str:
+    """Panel header: its own title on wide screens; both entries act as tabs on narrow screens."""
+    tabs = [("left", "① 輸入與生成"), ("right", "② 匯出與編輯")]
+    btns = "".join(
+        f'<button type="button" class="side-tab{" own" if side == own else ""}{" active" if side == "left" else ""}" '
+        f'data-side="{side}">{title}</button>'
+        for side, title in tabs
+    )
+    return f'<div class="panel-head">{btns}</div>'
+
+
+def sub_head(title: str, detail: Optional[str] = None) -> str:
+    return f'<div class="sub-head">{title}{tip_html(detail) if detail else ""}</div>'
+
+
+def hint_line(text: str, detail: Optional[str] = None) -> str:
+    return f'<div class="hint-line">{text}{tip_html(detail) if detail else ""}</div>'
+
+
+SAMPLING_HELP = (
+    "TRELLIS.2 分三個階段生成，每個階段都用 flow matching 從雜訊逐步去噪：\n"
+    "1. 稀疏結構：決定哪些體素被佔據，也就是整體輪廓與大致形狀。\n"
+    "2. 形狀：在這些體素上生成精細幾何（表面細節、邊角）。\n"
+    "3. 材質：依形狀生成 PBR 材質（顏色、金屬度、粗糙度）。\n\n"
+    "引導強度（CFG）越高越貼近輸入圖片，過高會過度銳化、破面或顏色過飽和，1 = 不使用引導。\n"
+    "引導重新縮放用來抑制高引導強度造成的過度飽和與爆亮，0 = 不抑制、1 = 完全抑制。\n"
+    "取樣步數越多越穩定、細節越完整，但時間大致與步數成正比。\n"
+    "時間重新縮放越大越把步數集中在高雜訊（決定大結構）的階段，通常讓整體結構更穩，過大可能損失細節。\n\n"
+    "預設值為官方建議值。"
+)
+INTERVAL_HELP = (
+    "只在去噪過程的這段時間內套用「引導強度」（0 = 去噪結束、1 = 純雜訊開始）。"
+    "區間越大，越多步驟受圖片引導，結果越貼近圖片但也越容易過度銳化；"
+    "起點調低會讓引導延伸到細節階段，終點調低則讓開頭的大結構更自由。起點必須小於終點。"
+)
+SAMPLING_DEFAULTS = (7.5, 0.7, 12, 5.0, 7.5, 0.5, 12, 3.0, 1.0, 0.0, 12, 3.0, 0.6, 1.0, 0.6, 1.0, 0.6, 0.9)
+EXPORT_DEFAULTS = (0.0, 90, 0, 1, 1, list(ALPHA_MODES)[0])
+
+
+with gr.Blocks(delete_cache=(600, 600), title="TRELLIS.2 圖片轉 3D", fill_width=True) as demo:
+    gr.HTML(topbar_html, elem_id="topbar", container=False)
+
+    with gr.Tabs(selected="gen", elem_id="main-tabs") as tabs:
         with gr.Tab("圖片轉 3D", id="gen"):
-            with gr.Row():
-                # Three panels: input/generation | preview | editing & settings (side panels scroll independently)
-                with gr.Column(scale=3, min_width=320, elem_id="col-left"):
-                    image_prompt = gr.Image(label="輸入圖片", format="png", image_mode="RGBA", type="pil", sources=["upload", "clipboard"], height=400)
-                    gr.Markdown(
-                        "*上傳後會自動去背並裁切到物件範圍。若圖片已有透明背景（PNG 帶 alpha），會直接使用不再去背。"
-                        "**請上傳單一視角**：正面或 3/4 角度效果最好；三視圖整張上傳會被生成成三個物件。*"
-                    )
-
-                    resolution = gr.Radio(
-                        ["512", "1024", "1536"], label="解析度", value="1024",
-                        info="生成的體素解析度，決定幾何與材質的細緻程度。"
-                             "512：最快（約 15 秒），細節較少，適合快速試圖；"
-                             "1024：建議值（生成約 45 秒、匯出約 30 秒），細節與速度平衡；"
-                             "1536：細節最多，但生成約 2 分鐘、匯出 GLB 約 5 分鐘且會用滿 32GB 顯存。",
-                    )
-                    seed = gr.Slider(
-                        0, MAX_SEED, label="隨機種子", value=0, step=1,
-                        info="決定生成時的隨機雜訊。相同圖片 + 相同種子 + 相同參數會得到相同結果；"
-                             "換種子會得到不同的形狀與細節變化。找到滿意的結果時記下種子，之後可重現。",
-                    )
-                    randomize_seed = gr.Checkbox(
-                        label="每次隨機產生種子", value=True,
-                        info="勾選：每次按「生成」都換一個新種子（探索不同結果）；"
-                             "取消勾選：使用上方固定的種子（重現或微調參數比較差異）。",
-                    )
-                    decimation_target = gr.Slider(
-                        10, 1000000, label="減面目標（面數）", value=500000, step=10,
-                        info="匯出 GLB 時重新網格化後要保留的三角面數上限（可直接在右側數字框輸入）。"
-                             "越高：細節越多、檔案越大、遊戲中渲染越吃效能；越低：越輕量但小細節會被抹平。"
-                             "下限 10 是實測仍可運算的最低值，但形狀會隨面數急速崩壞：約 2 萬面仍完整、"
-                             "5 千面大致完整、1 千面細部開始消失、100 面以下嚴重變形。"
-                             "遊戲角色/機甲部件建議 1～5 萬（主角可到 10～30 萬），展示用 50～100 萬。"
-                             "也是 GLB 壓縮能降到多少面數的主要因素。",
-                    )
-                    texture_size = gr.Slider(
-                        1024, 4096, label="貼圖尺寸", value=2048, step=1024,
-                        info="烘焙出的 PBR 貼圖（基礎色、金屬度、粗糙度）邊長像素。"
-                             "越大：表面花紋與文字越清晰，但檔案與顯存用量約隨邊長平方成長；"
-                             "1024 適合遠景或小物件、2048 為一般建議、4096 適合主角近拍。",
-                    )
-
-                    generate_btn = gr.Button("生成", variant="primary")
-
-                with gr.Column(scale=6, min_width=480, elem_id="col-mid"):
-                    with gr.Walkthrough(selected=0) as walkthrough:
-                        with gr.Step("預覽", id=0):
-                            candidate_pick = gr.Radio(
-                                [], label="候選模型",
-                                info="「專家設定 → 一次生成幾個候選」大於 1 時，可在這裡切換要使用哪一個（會重設 GLB 編輯狀態）。",
-                            )
-                            view_mode = gr.Radio(
-                                [VIEW_STATIC, VIEW_LIVE], value=VIEW_STATIC, label="預覽方式",
-                                info="靜態渲染預覽：生成後立即可看，6 種渲染模式 × 8 個視角；"
-                                     "即時 3D 檢視：自動匯出 GLB（約 30 秒）後用 three.js 自由旋轉縮放，並可使用 GLB 編輯功能。",
-                            )
-                            preview_output = gr.HTML(empty_html, label="3D 素材預覽", show_label=True, container=True, elem_id="preview-static")
-                            live_view = gr.HTML(live_viewer_html, label="即時 3D 檢視（three.js）", show_label=True, container=True, elem_id="preview-live")
-                            with gr.Row():
-                                extract_btn = gr.Button("匯出 GLB")
-                                to_shrink_btn = gr.Button("送到 GLB 壓縮 ➜")
-                            gr.Markdown("*「匯出 GLB」：依目前的減面、貼圖、GLB 編輯與專家設定輸出可下載的 GLB；"
-                                        "「送到 GLB 壓縮」：把目前編輯好的模型帶到 GLB 壓縮分頁做 Draco + WebP 壓縮。*")
-                        with gr.Step("匯出", id=1):
-                            glb_output = gr.Model3D(label="已匯出的 GLB", height=724, show_label=True, display_mode="solid", clear_color=(0.25, 0.25, 0.25, 1.0))
-                            download_btn = gr.DownloadButton(label="下載 GLB")
-                            dims_md = gr.Markdown("")
-                            to_shrink_btn2 = gr.Button("送到 GLB 壓縮 ➜")
-                            gr.Markdown("*匯出 GLB 需要重新網格化、減面與材質烘焙，通常需要半分鐘以上，請耐心等候。*")
-
-                with gr.Column(scale=3, min_width=340, elem_id="col-right"):
-                    with gr.Accordion(label="GLB 編輯（部件、尺寸、方向、原點）", open=True):
-                        gr.Markdown("匯出 GLB（或切換到即時 3D 檢視）後即可編輯，每次調整約 1–3 秒自動重新匯出。"
-                                    "*套用順序：保留部件 → 旋轉 → 等比例縮放 → 移動原點。*")
-                        keep_parts = gr.CheckboxGroup(
-                            [], label="保留的部件",
-                            info="匯出時會自動把空間上分開的物件分成「部件 1、2、3…」（依大小排序，括號內為面數占比），"
-                                 "編號會以黃色數字標示在即時 3D 檢視中。取消勾選即從 GLB 刪除該部件，"
-                                 "例如三視圖生成的三個模型只保留一個。至少需保留一個。",
+            # Workspace: input panel | viewer | export & edit panel (see the .ws css for breakpoints)
+            with gr.Row(elem_id="ws", elem_classes="ws", equal_height=False):
+                # ---- ① Input & generation ----
+                with gr.Column(elem_id="col-left", elem_classes="side-panel", min_width=0):
+                    gr.HTML(panel_head("left"), container=False, elem_classes="panel-head-wrap")
+                    with gr.Column(elem_classes="panel-scroll"):
+                        image_prompt = gr.Image(label="輸入圖片", format="png", image_mode="RGBA", type="pil",
+                                                sources=["upload", "clipboard"], height=260, elem_id="input-image")
+                        gr.HTML(hint_line(
+                            "單一視角，正面或 3/4 角度效果最好",
+                            "上傳後會自動去背並裁切到物件範圍。若圖片已有透明背景（PNG 帶 alpha），會直接使用不再去背。"
+                            "請上傳單一視角：三視圖整張上傳會被生成成三個物件。",
+                        ), container=False)
+                        resolution = gr.Radio(
+                            ["512", "1024", "1536"], label="解析度", value="1024", elem_classes="seg",
+                            info=tip("越高越細緻，但生成與匯出越久",
+                                     "生成的體素解析度，決定幾何與材質的細緻程度。"
+                                     "512：最快，細節較少，適合快速試圖；"
+                                     "1024：建議值，細節與速度平衡；"
+                                     "1536：細節最多，但生成與匯出 GLB 都最久，顯存需求也最高"
+                                     "（32GB 顯卡約用滿；12GB 顯卡匯出會借用系統記憶體而明顯變慢）。"),
                         )
-                        scale_mode = gr.Dropdown(
-                            SCALE_MODES, value=SCALE_NONE, label="縮放依據", min_width=160,
-                            info="TRELLIS 會把每個模型正規化成最長邊約 100 cm，不同部件比例不一致。"
-                                 "選擇以哪一軸為基準，等比例縮放成右側指定的實際長度（旋轉後的軸向）。",
+                        with gr.Column(elem_classes="seed-group"):
+                            gr.HTML(sub_head(
+                                "種子",
+                                "決定生成時的隨機雜訊。相同圖片 + 相同種子 + 相同參數會得到相同結果；"
+                                "換種子會得到不同的形狀與細節變化。\n"
+                                "未鎖定：每次按「生成」都會換新種子（生成後這裡會顯示用了哪個種子）。\n"
+                                "🔒 鎖定：一直使用這個種子，用來重現結果或微調參數比較差異。\n"
+                                "🎲：立即換一個新的隨機種子。",
+                            ), container=False)
+                            with gr.Row(elem_classes="seed-row"):
+                                seed = gr.Number(value=0, precision=0, minimum=0, maximum=MAX_SEED, label="種子",
+                                                 show_label=False, container=False, min_width=0)
+                                dice_btn = gr.Button("🎲", size="sm", scale=0, min_width=40, elem_classes="icon-btn")
+                                lock_seed = gr.Checkbox(label="🔒 鎖定", value=False, scale=0, min_width=0,
+                                                        elem_classes="lock-seed")
+                        num_candidates = gr.Radio(
+                            [1, 2, 3, 4], value=1, label="候選數量", elem_classes="seg",
+                            info=tip("一次生成幾個模型挑選",
+                                     "以種子、種子+1、種子+2…各生成一個模型，生成後可在檢視器上方切換，挑選最好的一個。"
+                                     "時間約與數量成正比，候選只保留到下次生成。"),
                         )
-                        target_cm = gr.Number(
-                            value=100, minimum=0.1, label="目標長度（cm）", min_width=120,
-                            info="縮放依據那一軸要變成的實際長度。GLB 單位為公尺，three.js 中 1 單位 = 1 m。"
-                                 "按 Enter 或點到其他地方套用。",
-                        )
-                        with gr.Row():
-                            rot_x = gr.Number(value=0, step=1, label="繞 X 軸旋轉（°）", min_width=100,
-                                              info="繞紅色 X 軸旋轉，常用於把向前/向後倒的模型扶正。")
-                            rot_y = gr.Number(value=0, step=1, label="繞 Y 軸旋轉（°）", min_width=100,
-                                              info="繞綠色 Y 軸（朝上）旋轉，用來調整模型面向的方向。")
-                            rot_z = gr.Number(value=0, step=1, label="繞 Z 軸旋轉（°）", min_width=100,
-                                              info="繞藍色 Z 軸旋轉，常用於把側躺的模型扶正。")
-                        gr.Markdown("*旋轉可輸入任意角度（可含小數、負數），固定依 X → Y → Z 順序套用；"
-                                    "依右手定則，從軸的正方向看過去正值為逆時針。按 Enter 或點到其他地方即套用。*")
-                        origin_mode = gr.Dropdown(
-                            ORIGIN_MODES, value=ORIGIN_CENTER, label="原點位置",
-                            info="GLB 的 (0,0,0) 放在哪裡，決定在 three.js 中 position 的基準點與旋轉的支點。"
-                                 "幾何中心：外框正中央；底部中心：腳底，適合站在地面的物件；"
-                                 "頂部中心：適合吊掛的部件（如手臂從肩膀往下）；"
-                                 "自訂：在即時 3D 檢視按「設定原點」再點選模型表面（例如關節處）。",
-                        )
-                        with gr.Row():
-                            origin_dx = gr.Number(value=0, step=0.1, label="原點微調 X（cm）", min_width=100,
-                                                  info="原點沿 X 軸再移動的距離，正值往紅色箭頭方向。")
-                            origin_dy = gr.Number(value=0, step=0.1, label="原點微調 Y（cm）", min_width=100,
-                                                  info="原點沿 Y 軸再移動的距離，正值往上。")
-                            origin_dz = gr.Number(value=0, step=0.1, label="原點微調 Z（cm）", min_width=100,
-                                                  info="原點沿 Z 軸再移動的距離，正值往藍色箭頭方向。")
-                        with gr.Row():
-                            gr.Markdown("*微調是在上方原點位置的基礎上，沿最終（旋轉、縮放後）的軸向移動；"
-                                        "點選模型設定原點時會自動歸零。即時 3D 檢視左上角會顯示模型相對原點的範圍。*")
-                            origin_offset_reset = gr.Button("微調歸零", size="sm", scale=0, min_width=90)
 
-                    with gr.Accordion(label="進階設定（三階段取樣參數）", open=False):
-                        gr.Markdown(
-                            "TRELLIS.2 分三個階段生成，每個階段都用 flow matching 從雜訊逐步去噪：\n"
-                            "1. **稀疏結構**：決定哪些體素被佔據，也就是整體輪廓與大致形狀。\n"
-                            "2. **形狀**：在這些體素上生成精細幾何（表面細節、邊角）。\n"
-                            "3. **材質**：依形狀生成 PBR 材質（顏色、金屬度、粗糙度）。\n\n"
-                            "四個參數的意義：**引導強度**（CFG）越高越貼近輸入圖片，過高會過度銳化、破面或顏色過飽和，1 = 不使用引導；"
-                            "**引導重新縮放**用來抑制高引導強度造成的過度飽和與爆亮，0 = 不抑制、1 = 完全抑制；"
-                            "**取樣步數**越多越穩定、細節越完整，但時間大致與步數成正比；"
-                            "**時間重新縮放**越大越把步數集中在高雜訊（決定大結構）的階段，通常讓整體結構更穩，"
-                            "過大可能損失細節。預設值為官方建議值。"
-                        )
-                        gr.Markdown("**階段 1：稀疏結構生成**（影響輪廓與整體形狀）")
-                        with gr.Row():
+                        with gr.Accordion("進階：取樣參數", open=False):
+                            gr.HTML(hint_line("三個生成階段的去噪設定，預設為官方建議值", SAMPLING_HELP), container=False)
+                            gr.HTML(sub_head("階段 1：稀疏結構（輪廓與整體形狀）"), container=False)
                             ss_guidance_strength = gr.Slider(1.0, 10.0, label="引導強度", value=7.5, step=0.1,
-                                                             info="預設 7.5。調高：輪廓更貼近圖片；調低：形狀更自由但可能偏離圖片。")
+                                                             info=tip("預設 7.5", "調高：輪廓更貼近圖片；調低：形狀更自由但可能偏離圖片。"))
                             ss_guidance_rescale = gr.Slider(0.0, 1.0, label="引導重新縮放", value=0.7, step=0.01,
-                                                            info="預設 0.7。出現多餘碎塊或過度膨脹時可調高。")
-                        with gr.Row():
+                                                            info=tip("預設 0.7", "出現多餘碎塊或過度膨脹時可調高。"))
                             ss_sampling_steps = gr.Slider(1, 50, label="取樣步數", value=12, step=1,
-                                                          info="預設 12。輪廓不穩或有缺塊時可增加到 20～30。")
-                            ss_rescale_t = gr.Slider(1.0, 6.0, label="時間重新縮放（Rescale T）", value=5.0, step=0.1,
-                                                     info="預設 5.0。此階段以大結構為主，建議維持較高值。")
-                        gr.Markdown("**階段 2：形狀生成**（影響幾何細節）")
-                        with gr.Row():
+                                                          info=tip("預設 12", "輪廓不穩或有缺塊時可增加到 20～30。"))
+                            ss_rescale_t = gr.Slider(1.0, 6.0, label="時間重新縮放", value=5.0, step=0.1,
+                                                     info=tip("預設 5.0", "Rescale T。此階段以大結構為主，建議維持較高值。"))
+                            gr.HTML(sub_head("階段 2：形狀（幾何細節）"), container=False)
                             shape_slat_guidance_strength = gr.Slider(1.0, 10.0, label="引導強度", value=7.5, step=0.1,
-                                                                     info="預設 7.5。調高：表面細節更貼近圖片；過高會出現尖刺或破面。")
+                                                                     info=tip("預設 7.5", "調高：表面細節更貼近圖片；過高會出現尖刺或破面。"))
                             shape_slat_guidance_rescale = gr.Slider(0.0, 1.0, label="引導重新縮放", value=0.5, step=0.01,
-                                                                    info="預設 0.5。表面出現雜訊或過度銳化時可調高。")
-                        with gr.Row():
+                                                                    info=tip("預設 0.5", "表面出現雜訊或過度銳化時可調高。"))
                             shape_slat_sampling_steps = gr.Slider(1, 50, label="取樣步數", value=12, step=1,
-                                                                  info="預設 12。增加可讓細節更完整，生成時間隨之增加。")
-                            shape_slat_rescale_t = gr.Slider(1.0, 6.0, label="時間重新縮放（Rescale T）", value=3.0, step=0.1,
-                                                             info="預設 3.0。調低會保留更多細部，調高結構更穩。")
-                        gr.Markdown("**階段 3：材質生成**（影響顏色與金屬/粗糙質感）")
-                        with gr.Row():
+                                                                  info=tip("預設 12", "增加可讓細節更完整，生成時間隨之增加。"))
+                            shape_slat_rescale_t = gr.Slider(1.0, 6.0, label="時間重新縮放", value=3.0, step=0.1,
+                                                             info=tip("預設 3.0", "Rescale T。調低會保留更多細部，調高結構更穩。"))
+                            gr.HTML(sub_head("階段 3：材質（顏色與金屬／粗糙質感）"), container=False)
                             tex_slat_guidance_strength = gr.Slider(1.0, 10.0, label="引導強度", value=1.0, step=0.1,
-                                                                   info="預設 1.0（不使用引導）。調高可讓顏色更接近圖片，過高易過飽和。")
+                                                                   info=tip("預設 1.0（不使用引導）", "調高可讓顏色更接近圖片，過高易過飽和。"))
                             tex_slat_guidance_rescale = gr.Slider(0.0, 1.0, label="引導重新縮放", value=0.0, step=0.01,
-                                                                  info="預設 0。調高引導強度後若顏色過飽和，再調高此值。")
-                        with gr.Row():
+                                                                  info=tip("預設 0", "調高引導強度後若顏色過飽和，再調高此值。"))
                             tex_slat_sampling_steps = gr.Slider(1, 50, label="取樣步數", value=12, step=1,
-                                                                info="預設 12。材質出現斑駁或雜訊時可增加。")
-                            tex_slat_rescale_t = gr.Slider(1.0, 6.0, label="時間重新縮放（Rescale T）", value=3.0, step=0.1,
-                                                           info="預設 3.0。一般不需調整。")
+                                                                info=tip("預設 12", "材質出現斑駁或雜訊時可增加。"))
+                            tex_slat_rescale_t = gr.Slider(1.0, 6.0, label="時間重新縮放", value=3.0, step=0.1,
+                                                           info=tip("預設 3.0", "Rescale T。一般不需調整。"))
+                            gr.HTML(sub_head("引導區間（0 = 去噪結束、1 = 純雜訊）", INTERVAL_HELP), container=False)
+                            ss_interval_start = gr.Slider(0.0, 1.0, value=0.6, step=0.05, label="階段 1 起點", info="預設 0.6")
+                            ss_interval_end = gr.Slider(0.0, 1.0, value=1.0, step=0.05, label="階段 1 終點", info="預設 1.0")
+                            shape_interval_start = gr.Slider(0.0, 1.0, value=0.6, step=0.05, label="階段 2 起點", info="預設 0.6")
+                            shape_interval_end = gr.Slider(0.0, 1.0, value=1.0, step=0.05, label="階段 2 終點", info="預設 1.0")
+                            tex_interval_start = gr.Slider(0.0, 1.0, value=0.6, step=0.05, label="階段 3 起點",
+                                                           info=tip("預設 0.6", "材質引導強度為 1 時此設定無作用。"))
+                            tex_interval_end = gr.Slider(0.0, 1.0, value=0.9, step=0.05, label="階段 3 終點", info="預設 0.9")
+                            sampling_reset_btn = gr.Button("還原取樣參數預設值", size="sm")
+                    with gr.Column(elem_classes="panel-foot"):
+                        generate_btn = gr.Button("▶ 生成", variant="primary", elem_id="generate-btn")
 
-                    with gr.Accordion(label="專家設定", open=False):
-                        gr.Markdown("#### 生成時生效（下次按「生成」才會套用）")
-                        num_candidates = gr.Slider(
-                            1, 4, value=1, step=1, label="一次生成幾個候選",
-                            info="以種子、種子+1、種子+2…各生成一個模型，生成後可在預覽上方切換挑選最好的。"
-                                 "時間約與數量成正比（1024 每個約 45 秒），候選只保留到下次生成。",
-                        )
-                        gr.Markdown(
-                            "**引導區間**：只在去噪過程的這段時間內套用「引導強度」（0 = 去噪結束、1 = 純雜訊開始）。"
-                            "區間越大，越多步驟受圖片引導，結果越貼近圖片但也越容易過度銳化；"
-                            "起點調低會讓引導延伸到細節階段，終點調低則讓開頭的大結構更自由。起點必須小於終點。"
-                        )
-                        with gr.Row():
-                            ss_interval_start = gr.Slider(0.0, 1.0, value=0.6, step=0.05, label="階段 1 區間起點",
-                                                          info="預設 0.6")
-                            ss_interval_end = gr.Slider(0.0, 1.0, value=1.0, step=0.05, label="階段 1 區間終點",
-                                                        info="預設 1.0")
-                        with gr.Row():
-                            shape_interval_start = gr.Slider(0.0, 1.0, value=0.6, step=0.05, label="階段 2 區間起點",
-                                                             info="預設 0.6")
-                            shape_interval_end = gr.Slider(0.0, 1.0, value=1.0, step=0.05, label="階段 2 區間終點",
-                                                           info="預設 1.0")
-                        with gr.Row():
-                            tex_interval_start = gr.Slider(0.0, 1.0, value=0.6, step=0.05, label="階段 3 區間起點",
-                                                           info="預設 0.6（材質引導強度為 1 時此設定無作用）")
-                            tex_interval_end = gr.Slider(0.0, 1.0, value=0.9, step=0.05, label="階段 3 區間終點",
-                                                         info="預設 0.9")
+                # ---- Viewer ----
+                with gr.Column(elem_id="col-mid", min_width=0):
+                    with gr.Row(elem_id="viewer-toolbar"):
+                        view_mode = gr.Radio([VIEW_STATIC, VIEW_LIVE], value=VIEW_STATIC, show_label=False,
+                                             container=False, elem_classes="seg", elem_id="view-mode")
+                        candidate_pick = gr.Radio([], show_label=False, container=False, elem_classes="seg seg-wrap",
+                                                  elem_id="cand")
+                    preview_output = gr.HTML(empty_html, show_label=False, elem_id="preview-static")
+                    live_view = gr.HTML(live_viewer_html, show_label=False, elem_id="preview-live")
 
-                        gr.Markdown("#### 匯出 GLB 時生效（變更後若已匯出，會自動重新匯出，約 30～45 秒）")
-                        exp_remesh_project = gr.Slider(
-                            0.0, 1.0, value=0.0, step=0.05, label="頂點吸附原表面（remesh_project）",
-                            info="重新網格化後，把頂點往原始高解析表面拉回的程度。0：維持重建後較圓滑的表面（預設）；"
-                                 "越接近 1：稜角、刻線越銳利，適合機甲、武器等硬邊造型，但可能出現細小鋸齒。建議硬邊模型試 0.6～0.9。",
+                # ---- ② Export & edit ----
+                with gr.Column(elem_id="col-right", elem_classes="side-panel", min_width=0):
+                    gr.HTML(panel_head("right"), container=False, elem_classes="panel-head-wrap")
+                    with gr.Column(elem_classes="panel-scroll"):
+                        face_preset = gr.Radio(
+                            [*FACE_PRESETS, FACE_CUSTOM], value="50 萬", label="面數", elem_classes="seg",
+                            info=tip("越高細節越多、檔案越大",
+                                     "匯出 GLB 時重新網格化後要保留的三角面數上限。"
+                                     "越高：細節越多、檔案越大、遊戲中渲染越吃效能；越低：越輕量但小細節會被抹平。"
+                                     "下限 10 是實測仍可運算的最低值，但形狀會隨面數急速崩壞：約 2 萬面仍完整、"
+                                     "5 千面大致完整、1 千面細部開始消失、100 面以下嚴重變形。"
+                                     "遊戲角色/機甲部件建議 1～5 萬（主角可到 10～30 萬），展示用 50～100 萬。"
+                                     "也是 GLB 壓縮能降到多少面數的主要因素。"),
                         )
-                        exp_cone_deg = gr.Slider(
-                            10, 180, value=90, step=5, label="UV 分塊角度（°）",
-                            info="UV 展開時，表面法線方向差異在此角度內的面會分在同一塊。"
-                                 "調大：UV 塊數與接縫變少，貼圖空間利用率較高，但大塊 UV 的貼圖可能較扭曲；"
-                                 "調小：接縫多但每塊扭曲小。實測對 GLB 壓縮後的面數影響很小（90°→150° 約少 2%），"
-                                 "匯出時間略增。預設 90。",
+                        decimation_target = gr.Number(value=500000, minimum=10, maximum=1000000, step=1000, precision=0,
+                                                      label="自訂面數（10～1,000,000）", elem_id="face-num")
+                        texture_size = gr.Radio(
+                            TEXTURE_SIZES, value=2048, label="貼圖尺寸", elem_classes="seg",
+                            info=tip("越大表面越清晰、檔案越大",
+                                     "烘焙出的 PBR 貼圖（基礎色、金屬度、粗糙度）邊長像素。"
+                                     "越大：表面花紋與文字越清晰，但檔案與顯存用量約隨邊長平方成長；"
+                                     "1K 適合遠景或小物件、2K 為一般建議、4K 適合主角近拍。"),
                         )
-                        exp_smooth = gr.Slider(
-                            0, 10, value=1, step=0.5, label="UV 分塊平滑度",
-                            info="分塊邊界的平滑強度。調高可讓分塊邊界更整齊、減少零碎小塊。預設 1。",
-                        )
-                        exp_refine_iters = gr.Slider(
-                            0, 10, value=0, step=1, label="UV 分塊細化次數",
-                            info="對分塊結果做局部細化的次數。增加可減少不規則的小碎塊，匯出時間略增。預設 0。",
-                        )
-                        exp_global_iters = gr.Slider(
-                            1, 10, value=1, step=1, label="UV 分塊全域迭代次數",
-                            info="整體重新分配分塊的次數。增加可讓分塊更合理、塊數更少，匯出時間略增。預設 1。",
-                        )
-                        exp_alpha_mode = gr.Dropdown(
-                            list(ALPHA_MODES), value=list(ALPHA_MODES)[0], label="透明度模式",
-                            info="TRELLIS 會烘焙出透明度，但原版一律以不透明輸出。"
-                                 "不透明：忽略透明度（預設，效能最好）；"
-                                 "半透明混合：玻璃座艙罩、能量罩等半透明部件會正確顯示，但半透明物件在遊戲中排序與效能成本較高；"
-                                 "透明裁切：透明度低於 50% 的部分直接挖空（適合鏤空網格、葉片），不需排序。",
-                        )
-                        expert_reset_btn = gr.Button("還原專家設定預設值", size="sm")
+
+                        with gr.Accordion("GLB 編輯：部件、尺寸、方向、原點", open=True):
+                            gr.HTML(hint_line(
+                                "匯出 GLB 後即可編輯，每次調整約 1–3 秒自動更新",
+                                "套用順序：保留部件 → 旋轉 → 等比例縮放 → 移動原點。"
+                                "編輯只會重新組裝已匯出的模型，不會重新網格化，所以很快。",
+                            ), container=False)
+                            keep_parts = gr.CheckboxGroup(
+                                [], label="保留的部件",
+                                info=tip("取消勾選即從 GLB 刪除該部件",
+                                         "匯出時會自動把空間上分開的物件分成「部件 1、2、3…」（依大小排序，括號內為面數占比），"
+                                         "編號會以黃色數字標示在即時 3D 中。取消勾選即從 GLB 刪除該部件，"
+                                         "例如三視圖生成的三個模型只保留一個。至少需保留一個。"),
+                            )
+                            with gr.Row(elem_classes="scale-row"):
+                                scale_mode = gr.Dropdown(
+                                    SCALE_MODES, value=SCALE_NONE, label="縮放依據", scale=3, min_width=0,
+                                    info=tip("以哪一軸為準縮放",
+                                             "TRELLIS 會把每個模型正規化成最長邊約 100 cm，不同部件比例不一致。"
+                                             "選擇以哪一軸為基準，等比例縮放成右側指定的實際長度（旋轉後的軸向）。"),
+                                )
+                                target_cm = gr.Number(
+                                    value=100, minimum=0.1, label="長度 cm", scale=2, min_width=0,
+                                    info=tip("按 Enter 套用",
+                                             "縮放依據那一軸要變成的實際長度。GLB 單位為公尺，three.js 中 1 單位 = 1 m。"
+                                             "按 Enter 或點到其他地方套用。"),
+                                )
+                            gr.HTML(sub_head(
+                                "旋轉（°）",
+                                "可輸入任意角度（可含小數、負數），或按 ±90° 快速旋轉。固定依 X → Y → Z 順序套用；"
+                                "依右手定則，從軸的正方向看過去正值為逆時針。按 Enter 或點到其他地方即套用。\n"
+                                "X（紅）：把向前/向後倒的模型扶正；Y（綠，朝上）：調整模型面向的方向；Z（藍）：把側躺的模型扶正。",
+                            ), container=False)
+                            rot_rows = []
+                            for axis in ("x", "y", "z"):
+                                with gr.Row(elem_classes="rot-row"):
+                                    gr.HTML(f'<span class="axis-chip {axis}">{axis.upper()}</span>', container=False,
+                                            elem_classes="axis-chip-wrap")
+                                    minus = gr.Button("−90°", size="sm", scale=0, min_width=48, elem_classes="icon-btn")
+                                    num = gr.Number(value=0, step=1, label=f"繞 {axis.upper()} 軸旋轉（°）", show_label=False,
+                                                    container=False, min_width=0, scale=1)
+                                    plus = gr.Button("+90°", size="sm", scale=0, min_width=48, elem_classes="icon-btn")
+                                rot_rows.append((minus, num, plus))
+                            rot_x, rot_y, rot_z = (r[1] for r in rot_rows)
+                            origin_mode = gr.Dropdown(
+                                ORIGIN_MODES, value=ORIGIN_CENTER, label="原點位置",
+                                info=tip("GLB 的 (0,0,0) 放在哪裡",
+                                         "決定在 three.js 中 position 的基準點與旋轉的支點。"
+                                         "幾何中心：外框正中央；底部中心：腳底，適合站在地面的物件；"
+                                         "頂部中心：適合吊掛的部件（如手臂從肩膀往下）；"
+                                         "自訂：在即時 3D 按「設定原點」再點選模型表面（例如關節處）。"),
+                            )
+                            gr.HTML(sub_head(
+                                "原點微調（cm）",
+                                "在上方原點位置的基礎上，沿最終（旋轉、縮放後）的軸向移動：X 正值往紅色箭頭方向、"
+                                "Y 正值往上、Z 正值往藍色箭頭方向。點選模型設定原點時會自動歸零。"
+                                "即時 3D 左上角會顯示模型相對原點的範圍。",
+                            ), container=False)
+                            with gr.Row(elem_classes="xyz-row"):
+                                origin_dx = gr.Number(value=0, step=0.1, label="X", min_width=0)
+                                origin_dy = gr.Number(value=0, step=0.1, label="Y", min_width=0)
+                                origin_dz = gr.Number(value=0, step=0.1, label="Z", min_width=0)
+                                origin_offset_reset = gr.Button("歸零", size="sm", scale=0, min_width=52, elem_classes="icon-btn")
+
+                        with gr.Accordion("進階：匯出設定", open=False):
+                            gr.HTML(hint_line("變更後若已匯出，會自動重新匯出（需重新網格化，較久）"), container=False)
+                            exp_remesh_project = gr.Slider(
+                                0.0, 1.0, value=0.0, step=0.05, label="頂點吸附原表面",
+                                info=tip("硬邊模型試 0.6～0.9",
+                                         "remesh_project。重新網格化後，把頂點往原始高解析表面拉回的程度。"
+                                         "0：維持重建後較圓滑的表面（預設）；越接近 1：稜角、刻線越銳利，"
+                                         "適合機甲、武器等硬邊造型，但可能出現細小鋸齒。"),
+                            )
+                            exp_cone_deg = gr.Slider(
+                                10, 180, value=90, step=5, label="UV 分塊角度（°）",
+                                info=tip("預設 90",
+                                         "UV 展開時，表面法線方向差異在此角度內的面會分在同一塊。"
+                                         "調大：UV 塊數與接縫變少，貼圖空間利用率較高，但大塊 UV 的貼圖可能較扭曲；"
+                                         "調小：接縫多但每塊扭曲小。實測對 GLB 壓縮後的面數影響很小（90°→150° 約少 2%），"
+                                         "匯出時間略增。"),
+                            )
+                            exp_smooth = gr.Slider(
+                                0, 10, value=1, step=0.5, label="UV 分塊平滑度",
+                                info=tip("預設 1", "分塊邊界的平滑強度。調高可讓分塊邊界更整齊、減少零碎小塊。"),
+                            )
+                            exp_refine_iters = gr.Slider(
+                                0, 10, value=0, step=1, label="UV 分塊細化次數",
+                                info=tip("預設 0", "對分塊結果做局部細化的次數。增加可減少不規則的小碎塊，匯出時間略增。"),
+                            )
+                            exp_global_iters = gr.Slider(
+                                1, 10, value=1, step=1, label="UV 分塊全域迭代次數",
+                                info=tip("預設 1", "整體重新分配分塊的次數。增加可讓分塊更合理、塊數更少，匯出時間略增。"),
+                            )
+                            exp_alpha_mode = gr.Dropdown(
+                                list(ALPHA_MODES), value=list(ALPHA_MODES)[0], label="透明度模式",
+                                info=tip("預設不透明",
+                                         "TRELLIS 會烘焙出透明度，但原版一律以不透明輸出。"
+                                         "不透明：忽略透明度（效能最好）；"
+                                         "半透明混合：玻璃座艙罩、能量罩等半透明部件會正確顯示，但半透明物件在遊戲中排序與效能成本較高；"
+                                         "透明裁切：透明度低於 50% 的部分直接挖空（適合鏤空網格、葉片），不需排序。"
+                                         "切換不需重新網格化。"),
+                            )
+                            expert_reset_btn = gr.Button("還原匯出設定預設值", size="sm")
+                    with gr.Column(elem_classes="panel-foot"):
+                        extract_btn = gr.Button("匯出 GLB", variant="primary", elem_id="extract-btn")
+                        with gr.Row(elem_classes="foot-row"):
+                            download_btn = gr.DownloadButton("⬇ 下載 GLB", size="sm", interactive=False)
+                            to_shrink_btn = gr.Button("送到 GLB 壓縮 ➜", size="sm")
+                        dims_md = gr.Markdown("", elem_id="dims-md")
 
         with gr.Tab("GLB 壓縮", id="shrink"):
-            # Mirrors github.com/lorenhsu1128/glb-shrink: hero strip, controls, before/after viewers
-            shrink_hero = gr.HTML(shrink_hero_html(), elem_id="shrink-hero")
-            with gr.Row():
-                with gr.Column(scale=1, min_width=320):
-                    gr.Markdown("### ◆ GLB 壓縮\nDraco + WebP 壓縮，產出適合遊戲、App、AR/VR 與網頁的輕量 3D 素材")
-                    shrink_file = gr.File(label="拖放 GLB 檔（或點擊瀏覽 · 最大 200 MB）", file_types=[".glb"],
-                                          type="filepath", height=140)
-                    shrink_meta = gr.Markdown("")
-                    shrink_preset = gr.Radio(
-                        list(SHRINK_PRESETS), value=list(SHRINK_PRESETS)[1], label="要多清晰？",
-                        info="快速選擇壓縮強度，會同步設定下方滑桿（0 / 50 / 100）。"
-                             "最小檔案：貼圖縮到 256 px、減面最多，適合遠景道具；"
-                             "平衡：貼圖 384 px，多數遊戲物件適用；最清晰：貼圖 512 px、保留較多面，適合近距離主角。",
+            # Mirrors github.com/lorenhsu1128/glb-shrink: size hero + controls | before/after viewers
+            with gr.Row(elem_id="ws-shrink", elem_classes="ws", equal_height=False):
+                with gr.Column(elem_id="shrink-left", elem_classes="side-panel", min_width=0):
+                    gr.HTML(
+                        '<div class="panel-head"><span class="panel-title">GLB 壓縮'
+                        + tip_html("Draco + WebP 壓縮，產出適合遊戲、App、AR/VR 與網頁的輕量 3D 素材。\n\n"
+                                   "流程：移除舊壓縮擴充 → 合併頂點 → meshoptimizer 減面 → 重算平滑法線 → "
+                                   "貼圖轉 WebP 並縮小 → Draco 幾何壓縮。輸出使用 KHR_draco_mesh_compression 與 "
+                                   "EXT_texture_webp，three.js 載入需搭配 DRACOLoader。\n\n"
+                                   "TRELLIS 生成的模型因 UV 接縫多，面數主要由「圖片轉 3D」的「面數」決定，"
+                                   "glb-shrink 主要壓縮檔案大小。")
+                        + '</span></div>',
+                        container=False, elem_classes="panel-head-wrap",
                     )
-                    shrink_quality = gr.Slider(
-                        0, 100, value=50, step=1, label="檔案更小 ↔ 外觀更清晰",
-                        info="在三個預設之間連續微調：數值越低，減面比例越大、貼圖越小（256→512 px），檔案越小；"
-                             "越高細節越多、檔案越大。幾何一律用 Draco 壓縮、貼圖一律轉 WebP。",
-                    )
-                    shrink_hint_md = gr.Markdown(shrink_hint(50))
-                    shrink_btn = gr.Button("壓縮模型", variant="primary")
-                    # Always rendered: a DownloadButton that starts hidden loses its file value when shown (Gradio 6)
-                    shrink_download = gr.DownloadButton("下載壓縮後的 GLB", interactive=False)
-                    gr.Markdown(
-                        "*流程：移除舊壓縮擴充 → 合併頂點 → meshoptimizer 減面 → 重算平滑法線 → "
-                        "貼圖轉 WebP 並縮小 → Draco 幾何壓縮。輸出使用 `KHR_draco_mesh_compression` 與 "
-                        "`EXT_texture_webp`，three.js 載入需搭配 `DRACOLoader`。*\n\n"
-                        "*TRELLIS 生成的模型因 UV 接縫多，面數主要由「圖片轉 3D」的「減面目標」決定，"
-                        "glb-shrink 主要壓縮檔案大小。*"
-                    )
-                with gr.Column(scale=3):
-                    gr.HTML(shrink_viewers_html)
+                    with gr.Column(elem_classes="panel-scroll"):
+                        shrink_hero = gr.HTML(shrink_hero_html(), elem_id="shrink-hero")
+                        shrink_file = gr.File(label="拖放 GLB 檔（或點擊瀏覽 · 最大 200 MB）", file_types=[".glb"],
+                                              type="filepath", height=150)
+                        shrink_meta = gr.Markdown("")
+                        shrink_preset = gr.Radio(
+                            list(SHRINK_PRESETS), value=list(SHRINK_PRESETS)[1], label="要多清晰？",
+                            info=tip("快速選擇壓縮強度",
+                                     "會同步設定下方滑桿（0 / 50 / 100）。"
+                                     "最小檔案：貼圖縮到 256 px、減面最多，適合遠景道具；"
+                                     "平衡：貼圖 384 px，多數遊戲物件適用；最清晰：貼圖 512 px、保留較多面，適合近距離主角。"),
+                        )
+                        shrink_quality = gr.Slider(
+                            0, 100, value=50, step=1, label="檔案更小 ↔ 外觀更清晰",
+                            info=tip("在三個預設之間連續微調",
+                                     "數值越低，減面比例越大、貼圖越小（256→512 px），檔案越小；"
+                                     "越高細節越多、檔案越大。幾何一律用 Draco 壓縮、貼圖一律轉 WebP。"),
+                        )
+                        shrink_hint_md = gr.Markdown(shrink_hint(50))
+                    with gr.Column(elem_classes="panel-foot"):
+                        shrink_btn = gr.Button("壓縮模型", variant="primary", elem_id="shrink-btn")
+                        # Always rendered: a DownloadButton that starts hidden loses its file value when shown (Gradio 6)
+                        shrink_download = gr.DownloadButton("⬇ 下載壓縮後的 GLB", interactive=False, size="sm")
+                with gr.Column(elem_id="shrink-mid", min_width=0):
+                    gr.HTML(shrink_viewers_html, elem_id="shrink-viewers-block", show_label=False)
 
-                    
     output_buf = gr.State()
     glb_cache = gr.State()  # GLB exported for the current generation: {'key': [decimation, texture], 'path': str}
     # Rendered but hidden via CSS: visible=False components do not deliver values to client-side js
@@ -2307,7 +2787,7 @@ with gr.Blocks(delete_cache=(600, 600), title="TRELLIS.2 圖片轉 3D") as demo:
     # Handlers
     demo.load(start_session)
     demo.unload(end_session)
-    
+
     image_prompt.upload(
         preprocess_image,
         inputs=[image_prompt],
@@ -2316,14 +2796,18 @@ with gr.Blocks(delete_cache=(600, 600), title="TRELLIS.2 圖片轉 3D") as demo:
 
     # Reset export/edit state for a new model (new generation or another candidate)
     def reset_for_new_model():
-        return (gr.Walkthrough(selected=0), VIEW_STATIC, None, "", "", gr.update(choices=[], value=[]), None, 0, 0, 0)
+        return (VIEW_STATIC, None, "", gr.update(value=None, interactive=False), "",
+                gr.update(choices=[], value=[]), None, 0, 0, 0)
 
-    reset_outputs = [walkthrough, view_mode, glb_cache, live_glb_url, dims_md, keep_parts, origin_point,
+    reset_outputs = [view_mode, glb_cache, live_glb_url, download_btn, dims_md, keep_parts, origin_point,
                      origin_dx, origin_dy, origin_dz]
+    viewer_progress = [preview_output, live_view]  # whichever is visible shows the progress overlay
+
+    dice_btn.click(lambda: int(np.random.randint(0, MAX_SEED)), outputs=[seed])
 
     generate_btn.click(
         get_seed,
-        inputs=[randomize_seed, seed],
+        inputs=[lock_seed, seed],
         outputs=[seed],
     ).then(
         reset_for_new_model, outputs=reset_outputs, js=RESET_VIEW_JS,
@@ -2338,6 +2822,7 @@ with gr.Blocks(delete_cache=(600, 600), title="TRELLIS.2 圖片轉 3D") as demo:
             tex_interval_start, tex_interval_end,
         ],
         outputs=[output_buf, preview_output, candidate_pick],
+        show_progress_on=[preview_output],
     )
 
     # Switching candidates behaves like a new generation for the export/edit state
@@ -2347,58 +2832,69 @@ with gr.Blocks(delete_cache=(600, 600), title="TRELLIS.2 圖片轉 3D") as demo:
         select_candidate, inputs=[candidate_pick], outputs=[output_buf, preview_output],
     )
 
+    sampling_params = [
+        ss_guidance_strength, ss_guidance_rescale, ss_sampling_steps, ss_rescale_t,
+        shape_slat_guidance_strength, shape_slat_guidance_rescale, shape_slat_sampling_steps, shape_slat_rescale_t,
+        tex_slat_guidance_strength, tex_slat_guidance_rescale, tex_slat_sampling_steps, tex_slat_rescale_t,
+        ss_interval_start, ss_interval_end, shape_interval_start, shape_interval_end, tex_interval_start, tex_interval_end,
+    ]
+    sampling_reset_btn.click(lambda: SAMPLING_DEFAULTS, outputs=sampling_params)
+
+    # Face-count presets <-> custom number
+    face_preset.input(lambda p: FACE_PRESETS.get(p, gr.skip()), inputs=[face_preset], outputs=[decimation_target])
+    decimation_target.input(
+        lambda n: next((k for k, v in FACE_PRESETS.items() if v == int(n or 0)), FACE_CUSTOM),
+        inputs=[decimation_target], outputs=[face_preset],
+    )
+
     expert_export = [exp_remesh_project, exp_cone_deg, exp_refine_iters, exp_global_iters, exp_smooth, exp_alpha_mode]
     export_inputs = [output_buf, decimation_target, texture_size, scale_mode, target_cm, rot_x, rot_y, rot_z,
                      keep_parts, origin_mode, origin_point, origin_dx, origin_dy, origin_dz, *expert_export, glb_cache]
-    live_outputs = [glb_cache, live_glb_url, glb_output, download_btn, dims_md, keep_parts]
+    live_outputs = [glb_cache, live_glb_url, download_btn, dims_md, keep_parts]
+    # Paired with a no-op backend fn: js-only events are not reliably chained in Gradio 6
+    load_live = dict(fn=lambda url: gr.skip(), inputs=[live_glb_url], outputs=[live_glb_url], js=LOAD_GLB_JS)
 
     view_mode.input(
         prepare_live_glb,
         inputs=[view_mode, *export_inputs],
         outputs=live_outputs,
         js=TOGGLE_VIEW_JS,
-    ).then(
-        # Paired with a no-op backend fn: js-only events are not reliably chained in Gradio 6
-        lambda url: gr.skip(), inputs=[live_glb_url], outputs=[live_glb_url], js=LOAD_GLB_JS,
-    )
+        show_progress_on=viewer_progress,
+    ).then(**load_live)
+
+    def refresh_after(event):
+        """Re-export an already exported GLB with the new edit settings and refresh the live view."""
+        event.then(
+            refresh_transformed_glb,
+            inputs=[view_mode, *export_inputs],
+            outputs=live_outputs,
+            show_progress_on=viewer_progress,
+        ).then(**load_live)
 
     # Editing parts/size/rotation/origin re-exports an already exported GLB (fast) and refreshes the live view
     for trigger in [keep_parts.input, scale_mode.input, origin_mode.input,
                     rot_x.submit, rot_x.blur, rot_y.submit, rot_y.blur, rot_z.submit, rot_z.blur,
                     origin_dx.submit, origin_dx.blur, origin_dy.submit, origin_dy.blur,
                     origin_dz.submit, origin_dz.blur, target_cm.submit, target_cm.blur,
-                    # Expert export options (remesh / UV changes rebuild the raw GLB, ~30 s)
+                    # Expert export options (remesh / UV changes rebuild the raw GLB)
                     exp_remesh_project.release, exp_cone_deg.release, exp_refine_iters.release,
                     exp_global_iters.release, exp_smooth.release, exp_alpha_mode.input]:
         trigger(
             refresh_transformed_glb,
             inputs=[view_mode, *export_inputs],
             outputs=live_outputs,
-        ).then(
-            lambda url: gr.skip(), inputs=[live_glb_url], outputs=[live_glb_url], js=LOAD_GLB_JS,
-        )
+            show_progress_on=viewer_progress,
+        ).then(**load_live)
 
-    expert_reset_btn.click(
-        lambda: (1, 0.6, 1.0, 0.6, 1.0, 0.6, 0.9, 0.0, 90, 0, 1, 1, list(ALPHA_MODES)[0]),
-        outputs=[num_candidates, ss_interval_start, ss_interval_end, shape_interval_start, shape_interval_end,
-                 tex_interval_start, tex_interval_end, *expert_export],
-    ).then(
-        refresh_transformed_glb,
-        inputs=[view_mode, *export_inputs],
-        outputs=live_outputs,
-    ).then(
-        lambda url: gr.skip(), inputs=[live_glb_url], outputs=[live_glb_url], js=LOAD_GLB_JS,
-    )
+    # ±90° quick rotation buttons (angles kept in [-180, 180))
+    for minus, num, plus in rot_rows:
+        for btn, delta in ((minus, -90), (plus, 90)):
+            refresh_after(btn.click(
+                lambda v, d=delta: ((float(v or 0) + d + 180) % 360) - 180, inputs=[num], outputs=[num],
+            ))
 
-    origin_offset_reset.click(
-        lambda: (0, 0, 0), outputs=[origin_dx, origin_dy, origin_dz],
-    ).then(
-        refresh_transformed_glb,
-        inputs=[view_mode, *export_inputs],
-        outputs=live_outputs,
-    ).then(
-        lambda url: gr.skip(), inputs=[live_glb_url], outputs=[live_glb_url], js=LOAD_GLB_JS,
-    )
+    refresh_after(expert_reset_btn.click(lambda: EXPORT_DEFAULTS, outputs=expert_export))
+    refresh_after(origin_offset_reset.click(lambda: (0, 0, 0), outputs=[origin_dx, origin_dy, origin_dz]))
 
     # The viewer clicks the hidden button after a surface pick; js swaps in the picked point
     origin_pick_btn.click(
@@ -2406,16 +2902,17 @@ with gr.Blocks(delete_cache=(600, 600), title="TRELLIS.2 圖片轉 3D") as demo:
         inputs=[origin_pick_box, view_mode, *export_inputs],
         outputs=[*live_outputs, origin_mode, origin_point, origin_dx, origin_dy, origin_dz],
         js=PICK_ORIGIN_JS,
-    ).then(
-        lambda url: gr.skip(), inputs=[live_glb_url], outputs=[live_glb_url], js=LOAD_GLB_JS,
-    )
+        show_progress_on=viewer_progress,
+    ).then(**load_live)
 
+    # 匯出 GLB: progress shows on the current preview, then the viewer switches to the live 3D view
     extract_btn.click(
-        lambda: gr.Walkthrough(selected=1), outputs=walkthrough
-    ).then(
-        extract_glb,
+        export_to_viewer,
         inputs=export_inputs,
-        outputs=[glb_output, download_btn, glb_cache, dims_md, keep_parts],
+        outputs=[view_mode, *live_outputs],
+        show_progress_on=viewer_progress,
+    ).success(
+        fn=lambda url: gr.skip(), inputs=[live_glb_url], outputs=[live_glb_url], js=SHOW_LIVE_JS,
     )
 
     # --- GLB 壓縮 tab ---
@@ -2442,13 +2939,13 @@ with gr.Blocks(delete_cache=(600, 600), title="TRELLIS.2 圖片轉 3D") as demo:
     ).then(**load_shrink_view)
 
     # Send the edited model from 圖片轉 3D straight into GLB 壓縮
-    for btn in [to_shrink_btn, to_shrink_btn2]:
-        btn.click(
-            send_to_shrink,
-            inputs=export_inputs,
-            outputs=[glb_cache, tabs, shrink_file, *shrink_ingest_outputs],
-        ).then(**load_shrink_view)
-        
+    to_shrink_btn.click(
+        send_to_shrink,
+        inputs=export_inputs,
+        outputs=[glb_cache, tabs, shrink_file, *shrink_ingest_outputs],
+        show_progress_on=viewer_progress,
+    ).then(**load_shrink_view)
+
 
 # Launch the Gradio app
 if __name__ == "__main__":
