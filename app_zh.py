@@ -23,6 +23,7 @@ import re
 import gc
 import ctypes
 from collections import OrderedDict
+from contextlib import contextmanager
 import trimesh
 from trellis2.modules.sparse import SparseTensor
 from trellis2.modules import image_feature_extractor
@@ -139,6 +140,86 @@ def release_memory():
     torch.cuda.empty_cache()
     if _libc is not None:
         _libc.malloc_trim(0)
+
+
+# ---------------------------------------------------------------------------
+# GPU status indicator (top bar): what the server is doing and how busy the GPU is
+# ---------------------------------------------------------------------------
+GPU_TASK = {"label": None, "since": 0.0, "session": None}  # one GPU job at a time (queue limit 1)
+GPU_STATUS_CONCURRENCY = "gpu_status"  # polling must not wait behind GPU jobs in the default queue
+_GPU_STATS = {"time": 0.0, "data": None}
+
+
+@contextmanager
+def gpu_task(label: str, req: Optional[gr.Request] = None):
+    """Mark the server as busy with label while the block runs (shown in the GPU status pill)."""
+    GPU_TASK.update(label=label, since=time.time(), session=str(req.session_hash) if req else None)
+    try:
+        yield
+    finally:
+        GPU_TASK.update(label=None, since=0.0, session=None)
+
+
+def read_gpu_stats() -> Optional[dict]:
+    """GPU name / memory / utilization via nvidia-smi (cached briefly; shared by all sessions)."""
+    now = time.time()
+    if _GPU_STATS["data"] is not None and now - _GPU_STATS["time"] < 1.5:
+        return _GPU_STATS["data"]
+    data = None
+    try:
+        line = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name,memory.used,memory.total,utilization.gpu",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=3,
+        ).stdout.strip().splitlines()[0]
+        name, used, total, util = (s.strip() for s in line.split(","))
+        data = {"name": name, "used": float(used) / 1024, "total": float(total) / 1024,
+                "util": int(util) if util.isdigit() else None}
+    except (OSError, subprocess.SubprocessError, IndexError, ValueError):
+        if torch.cuda.is_available():  # no nvidia-smi: memory only
+            free, total = torch.cuda.mem_get_info()
+            data = {"name": torch.cuda.get_device_name(), "used": (total - free) / 2**30,
+                    "total": total / 2**30, "util": None}
+    _GPU_STATS.update(time=now, data=data)
+    return data
+
+
+def queued_jobs() -> int:
+    """Jobs waiting in the (GPU) queue, excluding the status polling itself."""
+    try:
+        queues = demo._queue.event_queue_per_concurrency_id
+        return sum(len(q.queue) for cid, q in queues.items() if cid != GPU_STATUS_CONCURRENCY)
+    except AttributeError:  # Gradio internals changed: just omit the count
+        return 0
+
+
+def gpu_status_html(req: gr.Request) -> str:
+    stats = read_gpu_stats()
+    label, since = GPU_TASK["label"], GPU_TASK["since"]
+    waiting = queued_jobs()
+    parts = []
+    if stats:
+        name = re.sub(r"^(NVIDIA\s+)?(GeForce\s+)?", "", stats["name"])
+        pct = min(100, max(0, stats["used"] / stats["total"] * 100)) if stats["total"] else 0
+        parts.append(f'<span class="gpu-name">{html.escape(name)}</span>')
+        parts.append(f'<span class="gpu-mem">顯存 {stats["used"]:.1f}/{stats["total"]:.0f} GB'
+                     f'<span class="gpu-bar"><span style="width:{pct:.0f}%"></span></span></span>')
+        if stats["util"] is not None:
+            parts.append(f'<span class="gpu-util">使用率 {stats["util"]}%</span>')
+    if label:
+        elapsed = int(time.time() - since)
+        who = "你的工作" if GPU_TASK["session"] == str(req.session_hash) else "其他使用者"
+        task = f'{label} {elapsed // 60}:{elapsed % 60:02d}<span class="gpu-who">（{who}）</span>'
+    else:
+        task = "閒置"
+    if waiting:
+        task += f'<span class="gpu-who">・</span>排隊 {waiting}'
+    parts.append(f'<span class="gpu-task">{task}</span>')
+    title = "GPU 狀態：" + "　".join(re.sub(r"<[^>]+>", "", p) for p in parts)
+    state = "busy" if label else "idle"
+    return f'<div class="gpu-pill {state}" title="{html.escape(title)}"><span class="gpu-dot"></span>{"".join(parts)}</div>'
+
+
 MODES = [
     {"name": "法線", "icon": "assets/app/normal.png", "render_key": "normal"},
     {"name": "黏土渲染", "icon": "assets/app/clay.png", "render_key": "clay"},
@@ -392,7 +473,45 @@ footer { display: none !important; }
 .topbar .brand { font-weight: 800; font-size: 17px; color: var(--body-text-color); text-decoration: none; }
 
 .topbar .help-btn { margin-left: auto; }
-#main-tabs > .tab-wrapper { padding-left: 120px; padding-right: 110px; min-height: 42px; }
+#main-tabs > .tab-wrapper { padding-left: 120px; padding-right: 580px; min-height: 42px; }
+
+/* GPU status pill (left of the help button), refreshed every 2 s */
+#gpu-status {
+    position: absolute !important;
+    top: 6px;
+    right: 128px;
+    left: auto !important;
+    width: max-content !important;
+    max-width: 70vw;
+    z-index: 31;
+    padding: 0 !important;
+    border: none !important;
+    background: none !important;
+    min-height: 0 !important;
+}
+#gpu-status .prose, #gpu-status .html-container { width: max-content !important; padding: 0 !important; }
+.gpu-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 10px;
+    height: 30px;
+    padding: 0 12px;
+    border: 1px solid var(--border-color-primary);
+    border-radius: 15px;
+    background: var(--background-fill-secondary);
+    font-size: 12px;
+    color: var(--body-text-color);
+    white-space: nowrap;
+    cursor: default;
+}
+.gpu-dot { width: 9px; height: 9px; border-radius: 50%; background: #30a46c; flex: 0 0 auto; }
+.gpu-pill.busy .gpu-dot { background: #f76b15; animation: gpu-pulse 1.2s ease-in-out infinite; }
+@keyframes gpu-pulse { 50% { opacity: 0.35; } }
+.gpu-pill.busy .gpu-task { color: #f76b15; font-weight: 700; }
+.gpu-name { font-weight: 700; }
+.gpu-mem { display: inline-flex; align-items: center; gap: 6px; }
+.gpu-bar { display: inline-block; width: 46px; height: 6px; border-radius: 3px; background: var(--border-color-primary); overflow: hidden; }
+.gpu-bar > span { display: block; height: 100%; background: var(--color-accent); }
 #main-tabs > .tabitem { padding: 6px 0 0 !important; border: none !important; }
 
 /* Workspace grid */
@@ -612,6 +731,10 @@ footer { display: none !important; }
 @media (min-width: 1440px) {
     .ws { --panel-l: 330px; --panel-r: 360px; }
 }
+@media (max-width: 1439px) {
+    .gpu-name { display: none; }
+    #main-tabs > .tab-wrapper { padding-right: 470px; }
+}
 /* Small laptops / tablets in landscape: viewer + one side panel; the panel headers become tabs */
 @media (max-width: 1099px) {
     #ws {
@@ -625,7 +748,8 @@ footer { display: none !important; }
     .side-tab { display: inline-flex; pointer-events: auto; cursor: pointer; font-size: 14px; flex: 1 1 0; justify-content: center; border: 1px solid var(--border-color-primary); }
     .side-tab.active { background: var(--color-accent); color: #fff; border-color: var(--color-accent); }
     .side-tab.own:not(.active) { pointer-events: auto; }
-    #main-tabs > .tab-wrapper { padding-left: 110px; }
+    #main-tabs > .tab-wrapper { padding-left: 110px; padding-right: 400px; }
+    .gpu-util { display: none; }
 
 }
 /* Tablets in portrait / phones: one column, the page scrolls, main buttons stick to the bottom */
@@ -638,9 +762,13 @@ footer { display: none !important; }
     .side-panel { height: auto; overflow: visible; }
     .panel-scroll { overflow: visible; }
     .panel-foot { position: sticky; bottom: 0; z-index: 20; box-shadow: 0 -4px 12px rgba(0, 0, 0, 0.08); }
-    #main-tabs > .tab-wrapper { padding-left: 96px; padding-right: 44px; }
-    .topbar .brand { font-size: 15px; }
+    /* Phones: the status pill takes the brand's place; only state + elapsed time remain */
+    #main-tabs > .tab-wrapper { padding-left: 0; padding-right: 124px; }
+    .topbar .brand { display: none; }
     .help-btn .help-text { display: none; }
+    #gpu-status { right: 44px; }
+    .gpu-mem, .gpu-who { display: none; }
+    .gpu-pill { gap: 6px; padding: 0 10px; }
 }
 
 /* GLB 壓縮 tab (styled after glb-shrink) */
@@ -1641,7 +1769,7 @@ def end_session(req: gr.Request):
     release_memory()
 
 
-def preprocess_image(image: Image.Image) -> Image.Image:
+def preprocess_image(image: Image.Image, req: gr.Request) -> Image.Image:
     """
     Preprocess the input image.
 
@@ -1651,7 +1779,8 @@ def preprocess_image(image: Image.Image) -> Image.Image:
     Returns:
         Image.Image: The preprocessed image.
     """
-    processed_image = pipeline.preprocess_image(image)
+    with gpu_task("去背中", req):
+        processed_image = pipeline.preprocess_image(image)
     return processed_image
 
 
@@ -1756,14 +1885,18 @@ def image_to_3d(
     release_memory()
 
     candidates = []
-    for i in range(int(num_candidates)):
-        outputs, latents = pipeline.run(image, seed=int(seed) + i, preprocess_image=False, return_latent=True, **params)
-        mesh = outputs[0]
-        mesh.simplify(16777216)  # nvdiffrast limit
-        images = render_utils.render_snapshot(mesh, resolution=1024, r=2, fov=36, nviews=STEPS, envmap=envmap)
-        candidates.append({'state': pack_state(latents), 'html': build_preview_html(images), 'seed': int(seed) + i})
-        del outputs, latents, mesh, images
-        release_memory()
+    n = int(num_candidates)
+    with gpu_task("生成中", req):
+        for i in range(n):
+            if n > 1:
+                GPU_TASK["label"] = f"生成中（候選 {i + 1}/{n}）"
+            outputs, latents = pipeline.run(image, seed=int(seed) + i, preprocess_image=False, return_latent=True, **params)
+            mesh = outputs[0]
+            mesh.simplify(16777216)  # nvdiffrast limit
+            images = render_utils.render_snapshot(mesh, resolution=1024, r=2, fov=36, nviews=STEPS, envmap=envmap)
+            candidates.append({'state': pack_state(latents), 'html': build_preview_html(images), 'seed': int(seed) + i})
+            del outputs, latents, mesh, images
+            release_memory()
     CANDIDATES[session] = candidates
 
     labels = candidate_labels(candidates)
@@ -2190,7 +2323,8 @@ def get_or_export_glb(
     if raw is None or raw['key'] != raw_key:
         RAW_GLB.pop(session, None)
         print(f"[export] {datetime.now():%T} remesh+bake start opts={raw_opts}", flush=True)
-        mesh = build_raw_glb(state, decimation_target, texture_size, raw_opts)
+        with gpu_task("匯出 GLB 中", req):
+            mesh = build_raw_glb(state, decimation_target, texture_size, raw_opts)
         print(f"[export] {datetime.now():%T} remesh+bake done {time.time() - t_start:.1f}s", flush=True)
         face_group, fracs = split_parts(mesh)
         labels = [f"部件 {i + 1}（{f * 100:.0f}%）" for i, f in enumerate(fracs)]
@@ -2399,7 +2533,8 @@ def shrink_compress(src: Optional[dict], quality: float, req: gr.Request, progre
     stem = re.sub(r'\.glb$', '', src['name'], flags=re.IGNORECASE)
     out_path = os.path.join(os.path.dirname(src['path']), f"{uuid.uuid4().hex[:8]}", f"{stem}-draco.glb")
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
-    result = run_shrink("compress", src['path'], out_path, str(int(quality)))
+    with gpu_task("GLB 壓縮中", req):
+        result = run_shrink("compress", src['path'], out_path, str(int(quality)))
     out = {'path': out_path, 'size': result['outputSize'], 'tris': result['stats']['finalTris']}
     return shrink_hero_html(src, out), shrink_view_json(src, out), gr.update(value=out_path, interactive=True)
 
@@ -2500,6 +2635,8 @@ EXPORT_DEFAULTS = (0.0, 90, 0, 1, 1, list(ALPHA_MODES)[0])
 
 with gr.Blocks(delete_cache=(600, 600), title="TRELLIS.2 圖片轉 3D", fill_width=True) as demo:
     gr.HTML(topbar_html, elem_id="topbar", container=False)
+    gpu_status = gr.HTML("", elem_id="gpu-status", container=False)
+    gpu_timer = gr.Timer(2.0)
 
     with gr.Tabs(selected="gen", elem_id="main-tabs") as tabs:
         with gr.Tab("圖片轉 3D", id="gen"):
@@ -2787,6 +2924,11 @@ with gr.Blocks(delete_cache=(600, 600), title="TRELLIS.2 圖片轉 3D", fill_wid
     # Handlers
     demo.load(start_session)
     demo.unload(end_session)
+
+    # GPU status pill: its own concurrency group so it keeps updating while a GPU job runs
+    for status_event in (demo.load, gpu_timer.tick):
+        status_event(gpu_status_html, outputs=[gpu_status], show_progress="hidden",
+                     concurrency_limit=None, concurrency_id=GPU_STATUS_CONCURRENCY, queue=True)
 
     image_prompt.upload(
         preprocess_image,
